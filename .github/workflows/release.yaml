@@ -298,11 +298,17 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           pattern: binary-*
-          merge-multiple: true
-          path: tmp
+          path: bin
 
       - name: Prepare release
         run: |
+          mkdir tmp
+          for DIR in bin/binary-*; do
+            if [[ -d "$DIR" && -f "$DIR/rancher-system-agent" ]]; then
+              ARCH=$(echo "$DIR" | awk -F'-' '{print $NF}')
+            fi
+            mv "$DIR/rancher-system-agent" "tmp/rancher-system-agent-$ARCH"
+          done
           cp install.sh system-agent-uninstall.sh tmp
           mkdir dist
           for file in tmp/*; do
