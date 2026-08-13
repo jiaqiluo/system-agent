@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -682,15 +683,21 @@ func TestRunOneTimeInstructionsStopsAtFirstFailure(t *testing.T) {
 		},
 	}
 
-	output, succeeded, err := a.runOneTimeInstructions(context.Background(), executionDir, cp, nil, 1)
+	result, err := a.runOneTimeInstructions(context.Background(), executionDir, cp, nil, 1, 0, nil, nil)
 	if err != nil {
 		t.Fatalf("runOneTimeInstructions returned error: %v", err)
 	}
-	if succeeded {
+	if result.Succeeded {
 		t.Error("expected succeeded=false because the second instruction failed")
 	}
+	if result.Completed != 1 {
+		t.Errorf("expected Completed=1 (only the first instruction ran to completion), got %d", result.Completed)
+	}
+	if result.Interruption != InterruptionNone {
+		t.Errorf("expected a plain failure to report no interruption, got %q", result.Interruption)
+	}
 
-	outputs := decodeOneTimeOutputs(t, output)
+	outputs := decodeOneTimeOutputs(t, result.Output)
 	if !strings.Contains(string(outputs["ok"]), "ok-output") {
 		t.Errorf("expected saved output for %q to contain %q, got %q", "ok", "ok-output", outputs["ok"])
 	}
@@ -901,7 +908,7 @@ func TestRunPeriodicInstructionsSkipsWhenNotDue(t *testing.T) {
 		"steady": {Name: "steady", LastSuccessfulRunTime: now.Add(-1 * time.Second).Format(time.UnixDate)},
 	})
 
-	output, succeeded, err := a.runPeriodicInstructions(context.Background(), executionDir, cp, existing, false, now)
+	output, succeeded, err := a.runPeriodicInstructions(context.Background(), executionDir, cp, existing, false, now, nil, nil)
 	if err != nil {
 		t.Fatalf("runPeriodicInstructions returned error: %v", err)
 	}
@@ -934,7 +941,7 @@ func TestRunPeriodicInstructionsRunsWhenDue(t *testing.T) {
 		},
 	}
 
-	output, succeeded, err := a.runPeriodicInstructions(context.Background(), executionDir, cp, nil, false, time.Now())
+	output, succeeded, err := a.runPeriodicInstructions(context.Background(), executionDir, cp, nil, false, time.Now(), nil, nil)
 	if err != nil {
 		t.Fatalf("runPeriodicInstructions returned error: %v", err)
 	}
@@ -1051,7 +1058,7 @@ func TestRunPeriodicInstructionsRecordsFailure(t *testing.T) {
 				"flaky": {Name: "flaky", LastSuccessfulRunTime: previousSuccess},
 			})
 
-			output, succeeded, err := a.runPeriodicInstructions(context.Background(), executionDir, cp, existing, false, now)
+			output, succeeded, err := a.runPeriodicInstructions(context.Background(), executionDir, cp, existing, false, now, nil, nil)
 			if err != nil {
 				t.Fatalf("runPeriodicInstructions returned error: %v", err)
 			}
@@ -1122,5 +1129,462 @@ func TestApplyBlockedByInterlock(t *testing.T) {
 	activePath := filepath.Join(interlockDir, applyinatorActiveInterlockFile)
 	if _, statErr := os.Stat(activePath); !os.IsNotExist(statErr) {
 		t.Errorf("expected applyinator-active file to not be created when blocked, stat err: %v", statErr)
+	}
+}
+
+// signalState describes how a Cancel/Pause channel is constructed for a test case.
+type signalState int
+
+const (
+	signalNil signalState = iota
+	signalOpen
+	signalClosed
+)
+
+func newSignal(s signalState) <-chan struct{} {
+	if s == signalNil {
+		return nil
+	}
+	ch := make(chan struct{})
+	if s == signalClosed {
+		close(ch)
+	}
+	return ch
+}
+
+func TestCheckInterruptionPrecedence(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name   string
+		cancel signalState
+		pause  signalState
+		want   Interruption
+	}{
+		{name: "nil channels are never ready", cancel: signalNil, pause: signalNil, want: InterruptionNone},
+		{name: "closed cancel reports a cancellation", cancel: signalClosed, pause: signalNil, want: InterruptionCanceled},
+		{name: "closed pause reports a pause", cancel: signalNil, pause: signalClosed, want: InterruptionPaused},
+		{name: "cancel wins over a simultaneously closed pause", cancel: signalClosed, pause: signalClosed, want: InterruptionCanceled},
+		{name: "open channels are not ready", cancel: signalOpen, pause: signalOpen, want: InterruptionNone},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			cancel, pause := newSignal(tc.cancel), newSignal(tc.pause)
+			// Repeated because a select over two ready channels picks pseudo-randomly: a single
+			// observation would not prove that cancel deterministically wins over pause.
+			for i := range 200 {
+				if got := checkInterruption(cancel, pause); got != tc.want {
+					t.Fatalf("iteration %d: expected %q, got %q", i, tc.want, got)
+				}
+			}
+		})
+	}
+}
+
+// waitForPath polls until path exists, failing the test if it has not appeared before the deadline.
+func waitForPath(t *testing.T, path string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(path); err == nil {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out after %s waiting for %s to exist", timeout, path)
+}
+
+// waitForGlob polls until at least one path matches pattern, failing the test if none does before
+// the deadline. Used to observe an instruction starting: execute() creates the instruction's
+// execution directory immediately before launching the command.
+func waitForGlob(t *testing.T, pattern string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		matches, err := filepath.Glob(pattern)
+		if err != nil {
+			t.Fatalf("bad glob pattern %q: %v", pattern, err)
+		}
+		if len(matches) > 0 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out after %s waiting for a path matching %s", timeout, pattern)
+}
+
+func assertPathAbsent(t *testing.T, path, reason string) {
+	t.Helper()
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("expected %s to not exist (%s), stat err: %v", path, reason, err)
+	}
+}
+
+// touchInstruction returns a one-time instruction that creates sentinel and returns immediately.
+func touchInstruction(name, sentinel string) planapi.OneTimeInstruction {
+	return planapi.OneTimeInstruction{
+		CommonInstruction: planapi.CommonInstruction{Name: name, Command: "sh", Args: []string{"-c", "touch " + sentinel}},
+	}
+}
+
+// gatedTouchInstruction returns a one-time instruction that creates sentinel and then blocks until
+// gate exists, giving a test a deterministic window during which the instruction is still running.
+func gatedTouchInstruction(name, sentinel, gate string) planapi.OneTimeInstruction {
+	script := "touch " + sentinel + "; while [ ! -e " + gate + " ]; do sleep 0.02; done"
+	return planapi.OneTimeInstruction{
+		CommonInstruction: planapi.CommonInstruction{Name: name, Command: "sh", Args: []string{"-c", script}},
+	}
+}
+
+type applyResult struct {
+	output ApplyOutput
+	err    error
+}
+
+// applyAsync runs Apply on its own goroutine so the test can drive Cancel/Pause while it is in flight.
+func applyAsync(a *Applyinator, input ApplyInput) <-chan applyResult {
+	results := make(chan applyResult, 1)
+	go func() {
+		output, err := a.Apply(context.Background(), input)
+		results <- applyResult{output: output, err: err}
+	}()
+	return results
+}
+
+func awaitApply(t *testing.T, results <-chan applyResult, timeout time.Duration) ApplyOutput {
+	t.Helper()
+	select {
+	case result := <-results:
+		if result.err != nil {
+			t.Fatalf("Apply returned error: %v", result.err)
+		}
+		return result.output
+	case <-time.After(timeout):
+		t.Fatalf("Apply did not return within %s", timeout)
+		return ApplyOutput{}
+	}
+}
+
+func TestApplyPreClosedCancelShortCircuitsBeforeTheLock(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires a POSIX shell")
+	}
+	t.Parallel()
+
+	sentinel := filepath.Join(t.TempDir(), "instruction-ran")
+	a := newTestApplyinator(t, "", false, "", "")
+	// Holding the apply lock is what makes this test pin the short-circuit above a.mu.Lock():
+	// Apply cannot reach any other code path while the lock is held.
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	cancel := make(chan struct{})
+	close(cancel)
+	plan := planapi.Plan{OneTimeInstructions: []planapi.OneTimeInstruction{touchInstruction("should-not-run", sentinel)}}
+
+	output := awaitApply(t, applyAsync(a, ApplyInput{
+		CalculatedPlan:               CalculatedPlan{Plan: plan, Checksum: "checksum-cancel-prelock"},
+		RunOneTimeInstructions:       true,
+		OneTimeInstructionAttempts:   1,
+		ReconcileFiles:               true,
+		Cancel:                       cancel,
+		ResumeFromOneTimeInstruction: 3,
+	}), 5*time.Second)
+
+	if output.Interruption != InterruptionCanceled {
+		t.Errorf("expected %q, got %q", InterruptionCanceled, output.Interruption)
+	}
+	if output.CompletedOneTimeInstructions != 3 {
+		t.Errorf("expected the incoming checkpoint (3) to be reported unchanged, got %d", output.CompletedOneTimeInstructions)
+	}
+	assertPathAbsent(t, sentinel, "no instruction may run once the apply is already cancelled")
+}
+
+func TestApplyPauseStopsBeforeTheNextInstruction(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires a POSIX shell")
+	}
+	t.Parallel()
+
+	dir := t.TempDir()
+	firstSentinel := filepath.Join(dir, "first-ran")
+	secondSentinel := filepath.Join(dir, "second-ran")
+	gate := filepath.Join(dir, "gate")
+
+	a := newTestApplyinator(t, "", false, "", "")
+	plan := planapi.Plan{
+		OneTimeInstructions: []planapi.OneTimeInstruction{
+			gatedTouchInstruction("first", firstSentinel, gate),
+			touchInstruction("second", secondSentinel),
+		},
+	}
+
+	pause := make(chan struct{})
+	results := applyAsync(a, ApplyInput{
+		CalculatedPlan:             CalculatedPlan{Plan: plan, Checksum: "checksum-pause"},
+		RunOneTimeInstructions:     true,
+		OneTimeInstructionAttempts: 1,
+		Pause:                      pause,
+	})
+
+	// Pause while instruction 0 is still running: it must be allowed to finish, and instruction 1
+	// must never start.
+	waitForPath(t, firstSentinel, 30*time.Second)
+	close(pause)
+	if err := os.WriteFile(gate, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	output := awaitApply(t, results, 30*time.Second)
+	if output.Interruption != InterruptionPaused {
+		t.Errorf("expected %q, got %q", InterruptionPaused, output.Interruption)
+	}
+	if output.CompletedOneTimeInstructions != 1 {
+		t.Errorf("expected CompletedOneTimeInstructions=1, got %d", output.CompletedOneTimeInstructions)
+	}
+	if !output.OneTimeApplySucceeded {
+		t.Error("expected a pause with no failure to still report OneTimeApplySucceeded=true")
+	}
+	assertPathAbsent(t, secondSentinel, "a pause stops before the next instruction")
+}
+
+func TestApplyResumeFromSkipsAlreadyCompletedInstructions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires a POSIX shell")
+	}
+	t.Parallel()
+
+	dir := t.TempDir()
+	firstSentinel := filepath.Join(dir, "first-ran")
+	secondSentinel := filepath.Join(dir, "second-ran")
+
+	a := newTestApplyinator(t, "", false, "", "")
+	plan := planapi.Plan{
+		OneTimeInstructions: []planapi.OneTimeInstruction{
+			touchInstruction("first", firstSentinel),
+			touchInstruction("second", secondSentinel),
+		},
+	}
+
+	output, err := a.Apply(context.Background(), ApplyInput{
+		CalculatedPlan:               CalculatedPlan{Plan: plan, Checksum: "checksum-resume"},
+		RunOneTimeInstructions:       true,
+		OneTimeInstructionAttempts:   1,
+		ResumeFromOneTimeInstruction: 1,
+	})
+	if err != nil {
+		t.Fatalf("Apply returned error: %v", err)
+	}
+	if output.Interruption != InterruptionNone {
+		t.Errorf("expected no interruption, got %q", output.Interruption)
+	}
+	if output.CompletedOneTimeInstructions != 2 {
+		t.Errorf("expected CompletedOneTimeInstructions=2, got %d", output.CompletedOneTimeInstructions)
+	}
+	assertPathAbsent(t, firstSentinel, "instructions below the resume index are treated as complete")
+	waitForPath(t, secondSentinel, time.Second)
+}
+
+func TestApplyCompletedOneTimeInstructionsIsAbsoluteAcrossResume(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires a POSIX shell")
+	}
+	t.Parallel()
+
+	dir := t.TempDir()
+	sentinel := func(i int) string { return filepath.Join(dir, "ran-"+strconv.Itoa(i)) }
+	firstGate := filepath.Join(dir, "gate-1")
+	secondGate := filepath.Join(dir, "gate-2")
+
+	a := newTestApplyinator(t, "", false, "", "")
+	plan := planapi.Plan{
+		OneTimeInstructions: []planapi.OneTimeInstruction{
+			touchInstruction("zero", sentinel(0)),
+			gatedTouchInstruction("one", sentinel(1), firstGate),
+			gatedTouchInstruction("two", sentinel(2), secondGate),
+			touchInstruction("three", sentinel(3)),
+		},
+	}
+	cp := CalculatedPlan{Plan: plan, Checksum: "checksum-absolute-checkpoint"}
+
+	// First cycle: pause while instruction 1 runs, so it completes and instruction 2 never starts.
+	pause := make(chan struct{})
+	results := applyAsync(a, ApplyInput{
+		CalculatedPlan:             cp,
+		RunOneTimeInstructions:     true,
+		OneTimeInstructionAttempts: 1,
+		Pause:                      pause,
+	})
+	waitForPath(t, sentinel(1), 30*time.Second)
+	close(pause)
+	if err := os.WriteFile(firstGate, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	first := awaitApply(t, results, 30*time.Second)
+	if first.Interruption != InterruptionPaused {
+		t.Fatalf("expected the first cycle to report %q, got %q", InterruptionPaused, first.Interruption)
+	}
+	if first.CompletedOneTimeInstructions != 2 {
+		t.Fatalf("expected the first cycle checkpoint to be 2, got %d", first.CompletedOneTimeInstructions)
+	}
+	assertPathAbsent(t, sentinel(2), "the first cycle paused before instruction 2")
+
+	// Second cycle: resume at the reported checkpoint and pause again one instruction later. The
+	// checkpoint must compose (3), not restart from this cycle's own count (1).
+	resumePause := make(chan struct{})
+	results = applyAsync(a, ApplyInput{
+		CalculatedPlan:               cp,
+		RunOneTimeInstructions:       true,
+		OneTimeInstructionAttempts:   1,
+		Pause:                        resumePause,
+		ResumeFromOneTimeInstruction: first.CompletedOneTimeInstructions,
+	})
+	waitForPath(t, sentinel(2), 30*time.Second)
+	close(resumePause)
+	if err := os.WriteFile(secondGate, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	second := awaitApply(t, results, 30*time.Second)
+
+	if second.Interruption != InterruptionPaused {
+		t.Errorf("expected the second cycle to report %q, got %q", InterruptionPaused, second.Interruption)
+	}
+	if second.CompletedOneTimeInstructions != 3 {
+		t.Errorf("expected the resumed checkpoint to be absolute (3), got %d", second.CompletedOneTimeInstructions)
+	}
+	assertPathAbsent(t, sentinel(3), "the second cycle paused before instruction 3")
+}
+
+func TestApplyCancelDuringLongRunningInstructionReturnsPromptly(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires a POSIX shell")
+	}
+	t.Parallel()
+
+	const checksum = "checksum-cancel-inflight"
+	workDir := t.TempDir()
+	a := newTestApplyinator(t, workDir, false, "", "")
+	plan := planapi.Plan{
+		OneTimeInstructions: []planapi.OneTimeInstruction{
+			{CommonInstruction: planapi.CommonInstruction{Name: "sleeper", Command: "sh", Args: []string{"-c", "sleep 60"}}},
+		},
+	}
+
+	cancel := make(chan struct{})
+	started := time.Now()
+	results := applyAsync(a, ApplyInput{
+		CalculatedPlan:             CalculatedPlan{Plan: plan, Checksum: checksum},
+		RunOneTimeInstructions:     true,
+		OneTimeInstructionAttempts: 1,
+		Cancel:                     cancel,
+	})
+
+	// execute() creates the instruction's execution directory immediately before launching the
+	// command, so its appearance means the sleep is about to be (or already is) in flight.
+	waitForGlob(t, filepath.Join(workDir, "*", checksum+"_0"), 30*time.Second)
+	close(cancel)
+
+	output := awaitApply(t, results, 10*time.Second)
+	if elapsed := time.Since(started); elapsed > 30*time.Second {
+		t.Errorf("expected Apply to return well inside the 60s sleep, took %s", elapsed)
+	}
+	if output.Interruption != InterruptionCanceled {
+		t.Errorf("expected %q, got %q", InterruptionCanceled, output.Interruption)
+	}
+	if output.CompletedOneTimeInstructions != 0 {
+		t.Errorf("expected the killed instruction to not advance the checkpoint, got %d", output.CompletedOneTimeInstructions)
+	}
+}
+
+func TestApplyFailureIsNotReportedAsAnInterruption(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires a POSIX shell")
+	}
+	t.Parallel()
+
+	a := newTestApplyinator(t, "", false, "", "")
+	plan := planapi.Plan{
+		OneTimeInstructions: []planapi.OneTimeInstruction{
+			{CommonInstruction: planapi.CommonInstruction{Name: "fails", Command: "sh", Args: []string{"-c", "exit 1"}}},
+		},
+	}
+
+	output, err := a.Apply(context.Background(), ApplyInput{
+		CalculatedPlan:             CalculatedPlan{Plan: plan, Checksum: "checksum-failure-not-interruption"},
+		RunOneTimeInstructions:     true,
+		OneTimeInstructionAttempts: 1,
+	})
+	if err != nil {
+		t.Fatalf("Apply returned error: %v", err)
+	}
+	if output.OneTimeApplySucceeded {
+		t.Error("expected OneTimeApplySucceeded=false")
+	}
+	if output.Interruption != InterruptionNone {
+		t.Errorf("expected a plain failure to report no interruption, got %q", output.Interruption)
+	}
+	if output.CompletedOneTimeInstructions != 0 {
+		t.Errorf("expected a failed instruction to not advance the checkpoint, got %d", output.CompletedOneTimeInstructions)
+	}
+}
+
+func TestRunOneTimeInstructionsOutOfRangeResumeIndex(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires a POSIX shell")
+	}
+	t.Parallel()
+
+	testCases := []struct {
+		name         string
+		resumeFrom   int
+		wantExecuted bool
+	}{
+		{name: "resume exactly at the instruction count runs nothing", resumeFrom: 2, wantExecuted: false},
+		{name: "resume past the last instruction runs nothing", resumeFrom: 5, wantExecuted: false},
+		{name: "negative resume index starts from the first instruction", resumeFrom: -1, wantExecuted: true},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			dir := t.TempDir()
+			first, second := filepath.Join(dir, "first-ran"), filepath.Join(dir, "second-ran")
+			a := NewApplyinator(t.TempDir(), false, "", "", nil)
+			cp := CalculatedPlan{
+				Checksum: "checksum-resume-range",
+				Plan: planapi.Plan{
+					OneTimeInstructions: []planapi.OneTimeInstruction{
+						touchInstruction("first", first),
+						touchInstruction("second", second),
+					},
+				},
+			}
+
+			result, err := a.runOneTimeInstructions(context.Background(), t.TempDir(), cp, nil, 1, tc.resumeFrom, nil, nil)
+			if err != nil {
+				t.Fatalf("runOneTimeInstructions returned error: %v", err)
+			}
+			if !result.Succeeded {
+				t.Error("expected Succeeded=true")
+			}
+			if result.Interruption != InterruptionNone {
+				t.Errorf("expected no interruption, got %q", result.Interruption)
+			}
+			// Either nothing ran or everything ran, so the checkpoint is the full instruction count both ways.
+			if result.Completed != 2 {
+				t.Errorf("expected Completed=2, got %d", result.Completed)
+			}
+			if !tc.wantExecuted {
+				assertPathAbsent(t, first, "an out-of-range resume index must not execute anything")
+				assertPathAbsent(t, second, "an out-of-range resume index must not execute anything")
+				return
+			}
+			waitForPath(t, first, time.Second)
+			waitForPath(t, second, time.Second)
+		})
 	}
 }

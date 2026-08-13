@@ -77,11 +77,51 @@ func CalculatePlan(rawPlan []byte) (CalculatedPlan, error) {
 	}, nil
 }
 
+// Interruption reports why an apply stopped short of completing normally.
+type Interruption string
+
+const (
+	// InterruptionNone means the apply was not interrupted.
+	InterruptionNone Interruption = ""
+	// InterruptionPaused means the apply stopped at an instruction boundary and may be resumed.
+	InterruptionPaused Interruption = "paused"
+	// InterruptionCanceled means the apply was abandoned; the in-flight instruction was signaled.
+	InterruptionCanceled Interruption = "canceled"
+)
+
+// checkInterruption reports which interruption, if any, is already pending. It never blocks, and
+// a nil channel is never ready. Cancel is tested first: cancel wins over pause.
+func checkInterruption(cancel, pause <-chan struct{}) Interruption {
+	// A select over two ready channels picks pseudo-randomly, so cancel's precedence over pause
+	// has to be an explicit prior check rather than case ordering.
+	select {
+	case <-cancel:
+		return InterruptionCanceled
+	default:
+	}
+
+	select {
+	case <-pause:
+		return InterruptionPaused
+	default:
+	}
+
+	return InterruptionNone
+}
+
 type ApplyOutput struct {
 	OneTimeOutput          []byte
 	OneTimeApplySucceeded  bool
 	PeriodicOutput         []byte
 	PeriodicApplySucceeded bool
+	// Interruption is InterruptionNone unless the apply stopped early.
+	Interruption Interruption
+	// CompletedOneTimeInstructions is an ABSOLUTE count over the plan's one-time instructions,
+	// not a count of what this apply ran: the loop starts at
+	// ApplyInput.ResumeFromOneTimeInstruction and reports index+1. A plan paused after
+	// instruction 2, resumed, and paused again three instructions later therefore reports 5, not
+	// 3 — successive pause/resume cycles compose instead of resetting.
+	CompletedOneTimeInstructions int
 }
 
 type ApplyInput struct {
@@ -91,21 +131,51 @@ type ApplyInput struct {
 	ReconcileFiles             bool
 	ExistingOneTimeOutput      []byte
 	ExistingPeriodicOutput     []byte
+	// Cancel, when closed, abandons the apply as promptly as possible: the in-flight
+	// instruction's context is cancelled and no further instruction is started. A nil channel
+	// is never ready, so the zero value means "never cancelled".
+	Cancel <-chan struct{}
+	// Pause, when closed, stops the apply at the next instruction boundary. It never interrupts
+	// a running instruction: a checkpoint is only trustworthy if every instruction below
+	// ApplyOutput.CompletedOneTimeInstructions ran to completion. A nil channel is never ready.
+	Pause <-chan struct{}
+	// ResumeFromOneTimeInstruction is the index of the first one-time instruction to execute.
+	// Instructions below it are treated as already complete and are not re-run. Zero (the zero
+	// value) starts from the beginning.
+	ResumeFromOneTimeInstruction int
 }
 
-// Apply reconciles the local system to input.CalculatedPlan.
-// It honors the interlock and archives the plan.
-// It reconciles files and optionally runs one-time instructions.
-// It runs due periodic instructions.
-// It returns gzip+JSON encoded one-time and periodic outputs and their success flags.
-// ApplyOutput.OneTimeApplySucceeded is false when RunOneTimeInstructions is false.
+// Apply reconciles the local system against input.CalculatedPlan: it honors the interlock, archives the plan,
+// reconciles files, optionally runs one-time instructions, and always runs due periodic instructions. It returns
+// the updated one-time and periodic outputs (gzip+JSON encoded) alongside their success flags. Notably,
+// ApplyOutput.OneTimeApplySucceeded will be false if ApplyInput.RunOneTimeInstructions is false.
+//
+// An apply can be interrupted by the operator through input.Cancel and input.Pause. Cancel is prompt: it cancels
+// the in-flight instruction's context and starts nothing further. Pause is a boundary: it never interrupts a
+// running instruction, it only stops before the next one starts. Either way ApplyOutput.Interruption reports why
+// the apply stopped and ApplyOutput.CompletedOneTimeInstructions records the resume checkpoint — the absolute
+// number of one-time instructions known to have run to completion. Passing that value back as
+// ApplyInput.ResumeFromOneTimeInstruction on a later apply resumes the plan without re-running them. An
+// interrupted apply is a reported outcome, not a failure: the returned error stays nil.
 func (a *Applyinator) Apply(ctx context.Context, input ApplyInput) (ApplyOutput, error) {
 	logrus.Debugf("[applyinator] applying plan with checksum %s", input.CalculatedPlan.Checksum)
-	logrus.Tracef("[applyinator] applying plan - attempting to get lock")
 	output := ApplyOutput{
-		OneTimeOutput:  input.ExistingOneTimeOutput,
-		PeriodicOutput: input.ExistingPeriodicOutput,
+		OneTimeOutput:                input.ExistingOneTimeOutput,
+		PeriodicOutput:               input.ExistingPeriodicOutput,
+		CompletedOneTimeInstructions: input.ResumeFromOneTimeInstruction,
 	}
+
+	// This check has to happen before the lock, not merely before the file reconciliation: an apply that is
+	// already cancelled must not queue behind an in-flight apply on the mutex, and must not sit in
+	// checkInterlock's restart-pending wait for up to restartPendingTimeout only to return an error instead of
+	// a clean InterruptionCanceled.
+	if interruption := checkInterruption(input.Cancel, input.Pause); interruption != InterruptionNone {
+		logrus.Infof("[applyinator] not applying plan with checksum %s: %s before the apply started", input.CalculatedPlan.Checksum, interruption)
+		output.Interruption = interruption
+		return output, nil
+	}
+
+	logrus.Tracef("[applyinator] applying plan - attempting to get lock")
 	a.mu.Lock()
 	logrus.Tracef("[applyinator] applying plan - lock achieved")
 	defer a.mu.Unlock()
@@ -117,6 +187,21 @@ func (a *Applyinator) Apply(ctx context.Context, input ApplyInput) (ApplyOutput,
 		return output, err
 	}
 	defer cleanupInterlock()
+
+	// execCtx is the context handed to instruction execution. It is cancelled when input.Cancel closes, which
+	// is what makes a cancel prompt rather than a boundary.
+	execCtx, cancelExec := context.WithCancel(ctx)
+	defer cancelExec()
+	if input.Cancel != nil {
+		go func() {
+			select {
+			case <-input.Cancel:
+				cancelExec()
+			case <-execCtx.Done():
+				// Apply returned (or ctx was cancelled); exit so this goroutine cannot leak.
+			}
+		}()
+	}
 
 	executionDir := filepath.Join(a.workDir, nowString)
 	logrus.Tracef("[applyinator] applying calculated node plan contents %v", input.CalculatedPlan.Checksum)
@@ -148,20 +233,33 @@ func (a *Applyinator) Apply(ctx context.Context, input ApplyInput) (ApplyOutput,
 	}
 
 	if input.RunOneTimeInstructions {
-		oneTimeOutput, oneTimeSucceeded, err := a.runOneTimeInstructions(ctx, executionDir, input.CalculatedPlan, input.ExistingOneTimeOutput, input.OneTimeInstructionAttempts)
+		oneTime, err := a.runOneTimeInstructions(execCtx, executionDir, input.CalculatedPlan, input.ExistingOneTimeOutput,
+			input.OneTimeInstructionAttempts, input.ResumeFromOneTimeInstruction, input.Cancel, input.Pause)
 		if err != nil {
 			return output, err
 		}
-		output.OneTimeOutput = oneTimeOutput
-		output.OneTimeApplySucceeded = oneTimeSucceeded
+		output.OneTimeOutput = oneTime.Output
+		output.OneTimeApplySucceeded = oneTime.Succeeded
+		output.CompletedOneTimeInstructions = oneTime.Completed
+		if oneTime.Interruption != InterruptionNone {
+			// An interrupt suppresses execution: running periodic instructions after abandoning the
+			// one-time set would execute work the operator asked to stop.
+			output.Interruption = oneTime.Interruption
+			return output, nil
+		}
 	}
 
-	periodicOutput, periodicSucceeded, err := a.runPeriodicInstructions(ctx, executionDir, input.CalculatedPlan, input.ExistingPeriodicOutput, input.RunOneTimeInstructions, now)
+	periodicOutput, periodicSucceeded, err := a.runPeriodicInstructions(execCtx, executionDir, input.CalculatedPlan,
+		input.ExistingPeriodicOutput, input.RunOneTimeInstructions, now, input.Cancel, input.Pause)
 	if err != nil {
 		return output, err
 	}
 	output.PeriodicOutput = periodicOutput
 	output.PeriodicApplySucceeded = periodicSucceeded
+	// Periodic instructions have no checkpoint, so their interruption is only observable here.
+	if output.Interruption == InterruptionNone {
+		output.Interruption = checkInterruption(input.Cancel, input.Pause)
+	}
 
 	return output, nil
 }
@@ -268,47 +366,86 @@ func instructionExecutionDir(baseDir, checksum string, index int) (dir, prefix s
 	return filepath.Join(baseDir, prefix), prefix
 }
 
+// oneTimeResult is the outcome of one pass over a plan's one-time instructions.
+type oneTimeResult struct {
+	Output    []byte
+	Succeeded bool
+	// Completed is absolute: the index of the last instruction that returned, plus one.
+	Completed int
+	// Interruption is InterruptionNone unless the pass stopped early.
+	Interruption Interruption
+}
+
 // runOneTimeInstructions executes one-time instructions in order.
 // It stops at the first failure.
 // It returns the updated gzip+JSON encoded saved-output map and a success flag.
-func (a *Applyinator) runOneTimeInstructions(ctx context.Context, executionDir string, cp CalculatedPlan, existingOutput []byte, attempts int) ([]byte, bool, error) {
-	logrus.Infof("[applyinator] applying one-time instructions for plan with checksum %s", cp.Checksum)
+func (a *Applyinator) runOneTimeInstructions(ctx context.Context, executionDir string, cp CalculatedPlan, existingOutput []byte,
+	attempts, resumeFrom int, cancel, pause <-chan struct{},
+) (oneTimeResult, error) {
+	logrus.Infof("[applyinator] applying one-time instructions for plan with checksum %s starting at instruction %d", cp.Checksum, resumeFrom)
 	executionOutputs := map[string][]byte{}
 	if err := decodeGzipJSON(existingOutput, &executionOutputs); err != nil {
-		return nil, false, err
+		return oneTimeResult{}, err
 	}
 
-	oneTimeApplySucceeded := true
-	for index, instruction := range cp.Plan.OneTimeInstructions {
+	if resumeFrom < 0 {
+		// Defensive: a negative resume index would panic on the instruction lookup below. There is no
+		// meaningful checkpoint before the first instruction, so start from the beginning.
+		logrus.Warnf("[applyinator] negative resume index %d for plan %s, starting from the first instruction", resumeFrom, cp.Checksum)
+		resumeFrom = 0
+	}
+
+	result := oneTimeResult{Succeeded: true, Completed: min(resumeFrom, len(cp.Plan.OneTimeInstructions))}
+	for index := resumeFrom; index < len(cp.Plan.OneTimeInstructions); index++ {
+		if interruption := checkInterruption(cancel, pause); interruption != InterruptionNone {
+			logrus.Infof("[applyinator] plan %s %s before instruction %d; not executing it", cp.Checksum, interruption, index)
+			result.Interruption = interruption
+			break
+		}
+
+		instruction := cp.Plan.OneTimeInstructions[index]
 		logrus.Debugf("[applyinator] executing instruction %d attempt %d for plan %s", index, attempts, cp.Checksum)
 		instructionDir, prefix := instructionExecutionDir(executionDir, cp.Checksum, index)
 		executeOutput, _, exitCode, err := a.execute(ctx, prefix, instructionDir, instruction.CommonInstruction, true, attempts)
-		if err != nil || exitCode != 0 {
+		failed := err != nil || exitCode != 0
+		if failed {
 			logrus.Errorf("[applyinator] error executing instruction %d: %v", index, err)
-			oneTimeApplySucceeded = false
+			result.Succeeded = false
 		}
+		// Output from a killed or failed instruction is still worth saving, so this stays ahead of the break.
 		if instruction.Name == "" && instruction.SaveOutput {
 			logrus.Errorf("[applyinator] instruction does not have a name set, cannot save output data")
 		} else if instruction.SaveOutput {
 			executionOutputs[instruction.Name] = executeOutput
 		}
-		// If we have failed to apply our one-time instructions, we need to break in order to stop subsequent instructions from executing.
-		if !oneTimeApplySucceeded {
+		// If we have failed to apply our one-time instructions, we need to break in order to stop subsequent
+		// instructions from executing.
+		if failed {
+			// A cancel kills the in-flight instruction, so re-check: a cancel-induced kill must be reported
+			// as an interruption rather than as a plan failure. A pause never interrupts a running
+			// instruction, so a pause observed here did not cause the failure -- the instruction genuinely
+			// failed and Succeeded stays false -- but it still stops the loop.
+			result.Interruption = checkInterruption(cancel, pause)
+			// Completed does not advance past a failed instruction.
 			break
 		}
+		result.Completed = index + 1
 	}
 
 	output, err := encodeGzipJSON(executionOutputs)
 	if err != nil {
-		return nil, false, err
+		return oneTimeResult{}, err
 	}
-	return output, oneTimeApplySucceeded, nil
+	result.Output = output
+	return result, nil
 }
 
 // runPeriodicInstructions executes each due periodic instruction.
 // It returns the updated gzip+JSON encoded periodic-output map and a success flag.
 // Set ranOneTime to force every instruction to run regardless of period and cooldown.
-func (a *Applyinator) runPeriodicInstructions(ctx context.Context, executionDir string, cp CalculatedPlan, existingOutput []byte, ranOneTime bool, now time.Time) ([]byte, bool, error) {
+func (a *Applyinator) runPeriodicInstructions(ctx context.Context, executionDir string, cp CalculatedPlan, existingOutput []byte,
+	ranOneTime bool, now time.Time, cancel, pause <-chan struct{},
+) ([]byte, bool, error) {
 	nowUnixTimeString := now.Format(time.UnixDate)
 
 	periodicOutputs := map[string]planapi.PeriodicInstructionOutput{}
@@ -318,6 +455,11 @@ func (a *Applyinator) runPeriodicInstructions(ctx context.Context, executionDir 
 
 	periodicApplySucceeded := true
 	for index, instruction := range cp.Plan.PeriodicInstructions {
+		if interruption := checkInterruption(cancel, pause); interruption != InterruptionNone {
+			logrus.Infof("[applyinator] plan %s %s before periodic instruction %d; not executing it", cp.Checksum, interruption, index)
+			break
+		}
+
 		if instruction.Name == "" {
 			logrus.Errorf("[applyinator] periodic instruction %d did not have name, unable to run", index)
 			continue
