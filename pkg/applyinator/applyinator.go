@@ -836,9 +836,13 @@ func watchForTermination(ctx context.Context, cmd *exec.Cmd, pipes ...io.Closer)
 			logrus.Warnf("[applyinator] error terminating the process tree of pid %d: %v", pid, err)
 		}
 
+		// This wait has a process-exit arm, not just the timer: execute defers stop(), so done is
+		// closed as soon as cmd.Wait() returns. A terminateProcessTree that actually terminates the
+		// tree rather than asking it nicely — which is what Windows does, having no graceful signal
+		// to send — therefore short-circuits the grace period instead of stalling on it.
 		select {
 		case <-done:
-			// The tree took the hint and the instruction has been reaped.
+			// The tree is gone: either it took the hint, or terminateProcessTree killed it outright.
 			return
 		case <-time.After(instructionTerminationGrace):
 		}

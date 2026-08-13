@@ -49,11 +49,14 @@ func signalProcessTree(cmd *exec.Cmd, sig syscall.Signal) error {
 		return nil
 	}
 
-	// Only signal the group when the child is genuinely its own group leader, which is exactly
-	// what Setpgid guarantees. If configureProcessGroup failed, the child inherited *this daemon's*
-	// process group, and kill(-pgid) would deliver the signal to rancher-system-agent itself and to
-	// every other process it started. Degrading to a direct-child signal is far preferable to a
-	// root daemon killing itself.
+	// DO NOT simplify this to `if err != nil`. The pgid check is the load-bearing half.
+	//
+	// Only signal the group when the child is genuinely its own group leader, which is exactly what
+	// Setpgid guarantees. If configureProcessGroup failed, the child inherited *this daemon's*
+	// process group -- and in that case Getpgid does not fail, it *succeeds* and returns the
+	// agent's own pgid. kill(-pgid, SIGKILL) would then deliver the signal to rancher-system-agent
+	// itself and to every other process it started, so cancelling one plan would kill the agent.
+	// Degrading to a direct-child signal is far preferable to a root daemon killing itself.
 	pgid, err := syscall.Getpgid(cmd.Process.Pid)
 	if err != nil || pgid != cmd.Process.Pid {
 		return ignoreProcessGone(cmd.Process.Signal(sig))

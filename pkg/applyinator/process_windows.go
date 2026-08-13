@@ -101,14 +101,16 @@ func assignProcessTree(cmd *exec.Cmd) error {
 	return nil
 }
 
-// terminateProcessTree does nothing on Windows.
+// terminateProcessTree terminates the command's Job Object, exactly as killProcessTree does.
 //
 // Accepted caveat: Windows has no SIGTERM. There is no way to ask a process tree to shut down
-// cleanly, so no graceful signal is sent and the instruction is never given the chance to clean up
-// after itself. The watchdog's grace period therefore elapses without anything being asked of the
-// instruction, and killProcessTree then terminates the job outright.
+// cleanly, so there is nothing a distinct graceful step could do and the instruction is never given
+// the chance to clean up after itself. Cancelling therefore terminates the tree immediately, with
+// no grace period: this is the previously settled "Windows: direct kill" behaviour, widened from
+// the direct child to the whole tree. watchForTermination's grace wait has a process-exit arm, so
+// terminating here short-circuits it rather than stalling on it.
 func terminateProcessTree(cmd *exec.Cmd) error {
-	return nil
+	return killProcessTree(cmd)
 }
 
 // killProcessTree terminates every process in the command's Job Object.
