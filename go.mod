@@ -55,10 +55,11 @@ require (
 	github.com/urfave/cli/v2 v2.27.5
 	go.uber.org/mock v0.6.0
 	golang.org/x/sync v0.22.0
+	golang.org/x/sys v0.47.0
 	k8s.io/api v0.36.3
 	k8s.io/apimachinery v0.36.3
 	k8s.io/client-go v0.36.3
-	k8s.io/kubernetes v1.36.0
+	k8s.io/kubernetes v1.36.3
 	sigs.k8s.io/yaml v1.6.0
 )
 
@@ -147,7 +148,6 @@ require (
 	golang.org/x/exp v0.0.0-20251219203646-944ab1f22d93 // indirect
 	golang.org/x/net v0.58.0 // indirect
 	golang.org/x/oauth2 v0.36.0 // indirect
-	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/term v0.45.0 // indirect
 	golang.org/x/text v0.41.0 // indirect
 	golang.org/x/time v0.14.0 // indirect

@@ -55,6 +55,10 @@ const deleteFileAction = "delete"
 const defaultEffectivePeriod = 600 // 10 minutes
 const defaultFailureCooldown = 6
 
+// instructionTerminationGrace is how long a cancelled instruction's process tree is given to exit
+// after a graceful signal before it is killed outright.
+const instructionTerminationGrace = 10 * time.Second
+
 func NewApplyinator(workDir string, preserveWorkDir bool, appliedPlanDir, interlockDir string, imageUtil *image.Utility) *Applyinator {
 	return &Applyinator{
 		mu:              &sync.Mutex{},
@@ -675,6 +679,13 @@ func (a *Applyinator) writePlanToDisk(now time.Time, plan *CalculatedPlan) error
 	return writeContentToFile(filepath.Join(a.appliedPlanDir, file), os.Getuid(), os.Getgid(), 0600, anpString)
 }
 
+// execute stages the instruction's execution directory, runs its command, and returns the captured
+// stdout, stderr, exit code and wait error.
+//
+// The command is put into a process group (Unix) or Job Object (Windows) of its own, and a watchdog
+// is armed on ctx: when ctx is cancelled the whole process tree is signalled to terminate and, if
+// it has not exited within instructionTerminationGrace, killed. Signalling only the direct child
+// would leave the installer or package manager that a typical run.sh shells out to still running.
 func (a *Applyinator) execute(ctx context.Context, prefix, executionDir string, instruction planapi.CommonInstruction, combinedOutput bool, attempt int) ([]byte, []byte, int, error) {
 	if instruction.Image == "" {
 		logrus.Infof("[applyinator] no image provided, creating empty working directory %s", executionDir)
@@ -701,7 +712,7 @@ func (a *Applyinator) execute(ctx context.Context, prefix, executionDir string, 
 		command = executionDir + defaultCommand
 	}
 
-	cmd := exec.CommandContext(ctx, command, instruction.Args...)
+	cmd := exec.Command(command, instruction.Args...)
 	logrus.Infof("[applyinator] running command: %s %v", instruction.Command, instruction.Args)
 	cmd.Env = os.Environ()
 	cmd.Env = append(cmd.Env, instruction.Env...)
@@ -723,6 +734,12 @@ func (a *Applyinator) execute(ctx context.Context, prefix, executionDir string, 
 		return nil, nil, -1, err
 	}
 	defer stderr.Close()
+
+	// Before Start: SysProcAttr is only read at fork time. A failure here must not stop the
+	// instruction from running at all, it only degrades cancellation to a direct-child signal.
+	if err := configureProcessGroup(cmd); err != nil {
+		logrus.Errorf("[applyinator] error configuring the process group for %s: %v; cancelling it will only signal its direct child", command, err)
+	}
 
 	var (
 		eg           = errgroup.Group{}
@@ -755,8 +772,21 @@ func (a *Applyinator) execute(ctx context.Context, prefix, executionDir string, 
 	})
 
 	if err := cmd.Start(); err != nil {
+		// The watchdog is never armed on this path, so nothing else would release the platform
+		// handle configureProcessGroup may have created. releaseProcessTree is idempotent and a
+		// no-op when no handle was recorded.
+		releaseProcessTree(cmd)
 		return nil, nil, -1, err
 	}
+
+	// After Start: Windows can only assign a process to a Job Object once it exists. Degrades the
+	// same way as configureProcessGroup above.
+	if err := assignProcessTree(cmd); err != nil {
+		logrus.Errorf("[applyinator] error assigning %s to its process tree: %v; cancelling it will only signal its direct child", command, err)
+	}
+
+	stop := watchForTermination(ctx, cmd, stdout, stderr)
+	defer stop()
 
 	// Wait for I/O to complete before calling cmd.Wait() because cmd.Wait() will close the I/O pipes.
 	_ = eg.Wait()
@@ -774,6 +804,69 @@ func (a *Applyinator) execute(ctx context.Context, prefix, executionDir string, 
 	}
 	logrus.Infof("[applyinator] command %s %v finished with err: %v and exit code: %d", instruction.Command, instruction.Args, waitErr, exitCode)
 	return stdoutTarget.Bytes(), stderrTarget.Bytes(), exitCode, waitErr
+}
+
+// watchForTermination signals cmd's process tree once ctx is done: a graceful signal first,
+// escalating to an unconditional kill after instructionTerminationGrace. The pipes are closed
+// alongside the kill so streamLogs cannot block forever on a descendant that inherited them. The
+// returned func stops the watchdog and releases any platform handles; callers must defer it.
+func watchForTermination(ctx context.Context, cmd *exec.Cmd, pipes ...io.Closer) func() {
+	// done is closed by the returned func; finished is closed by the watchdog on its way out, so
+	// the returned func can be sure nothing is still signalling before it releases the handles.
+	done := make(chan struct{})
+	finished := make(chan struct{})
+
+	go func() {
+		defer close(finished)
+
+		select {
+		case <-done:
+			// The instruction finished on its own; there is nothing to terminate.
+			return
+		case <-ctx.Done():
+		}
+
+		pid := -1
+		if cmd.Process != nil {
+			pid = cmd.Process.Pid
+		}
+
+		logrus.Infof("[applyinator] apply was cancelled, terminating the process tree of pid %d", pid)
+		if err := terminateProcessTree(cmd); err != nil {
+			logrus.Warnf("[applyinator] error terminating the process tree of pid %d: %v", pid, err)
+		}
+
+		select {
+		case <-done:
+			// The tree took the hint and the instruction has been reaped.
+			return
+		case <-time.After(instructionTerminationGrace):
+		}
+
+		logrus.Warnf("[applyinator] process tree of pid %d did not exit within %s of being asked, killing it", pid, instructionTerminationGrace)
+		if err := killProcessTree(cmd); err != nil {
+			logrus.Warnf("[applyinator] error killing the process tree of pid %d: %v", pid, err)
+		}
+
+		// execute calls eg.Wait() before cmd.Wait(), and eg.Wait() only returns once both pipes
+		// reach EOF. A killed shell's grandchild inherits the write ends of those pipes, so without
+		// an explicit close here the apply hangs forever on a descendant the kill did not reach.
+		// This deliberately does not happen on the graceful path above, so a well-behaved
+		// instruction's final output is not truncated. Close errors are ignored: cmd.Wait() closes
+		// its own copies and a double close returns os.ErrClosed, which is expected.
+		for _, pipe := range pipes {
+			_ = pipe.Close()
+		}
+	}()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			close(done)
+			<-finished
+			releaseProcessTree(cmd)
+		})
+	}
 }
 
 // streamLogs reads lines from reader and appends them to outputBuffer.

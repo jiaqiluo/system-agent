@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -134,6 +135,10 @@ func TestAppliedPlanRetentionPolicy(t *testing.T) {
 	}
 }
 
+// TestExecuteCapturesStdoutStderrAndExitCode is also the happy-path guard for the termination
+// watchdog execute arms on every command: a command that is never cancelled must have its output
+// captured in full and its exit code reported unchanged, so the watchdog neither truncates output
+// by closing the pipes early nor interferes with exit reporting.
 func TestExecuteCapturesStdoutStderrAndExitCode(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("requires a POSIX shell")
@@ -1726,4 +1731,181 @@ func TestApplyPauseDuringPeriodicInstructionsIsReported(t *testing.T) {
 		t.Errorf("expected the one-time checkpoint to be reported unchanged (2), got %d", output.CompletedOneTimeInstructions)
 	}
 	assertPathAbsent(t, secondSentinel, "a pause stops before the next periodic instruction")
+}
+
+// assertFileStopsGrowing samples path's size and fails as soon as it grows during window. Used to
+// prove a backgrounded descendant of a cancelled instruction is really dead rather than orphaned:
+// a fixed wait followed by a single comparison would prove the same thing, but this reports the
+// failure the moment it happens instead of always burning the whole window.
+func assertFileStopsGrowing(t *testing.T, path string, window time.Duration) {
+	t.Helper()
+	initial, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat %s: %v", path, err)
+	}
+	deadline := time.Now().Add(window)
+	for time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+		current, err := os.Stat(path)
+		if err != nil {
+			t.Fatalf("stat %s: %v", path, err)
+		}
+		if current.Size() != initial.Size() {
+			t.Fatalf("expected %s to stop growing once the instruction was cancelled, but it grew from %d to %d bytes: "+
+				"a descendant of the cancelled instruction is still running", path, initial.Size(), current.Size())
+		}
+	}
+}
+
+// trappingCommand returns a command that installs a SIGTERM trap, announces itself by creating
+// started, and then idles. On SIGTERM it creates marker and exits 143 (128+SIGTERM), the exit
+// status a shell reports for a terminated process. The idle loop sleeps in short bursts because a
+// POSIX shell defers trap handlers until the current foreground command finishes.
+func trappingCommand(name, marker, started string) planapi.CommonInstruction {
+	script := "trap 'touch " + marker + "; exit 143' TERM; touch " + started + "; while true; do sleep 0.05; done"
+	return planapi.CommonInstruction{Name: name, Command: "sh", Args: []string{"-c", script}}
+}
+
+// backgroundedWriterCommand returns a command whose *grandchild* appends to sentinel forever while
+// the direct child sleeps for a minute. Cancelling it exercises two mechanisms at once: the signal
+// has to reach the whole process tree (the grandchild is not the process *exec.Cmd knows about),
+// and the grandchild inherits the stdout/stderr pipes, so execute's eg.Wait() cannot return while
+// it is alive.
+//
+// started is created by the grandchild rather than by the direct child, and only after its first
+// append, so waiting on it proves the grandchild is genuinely running and sentinel already exists.
+func backgroundedWriterCommand(name, sentinel, started string) planapi.CommonInstruction {
+	script := "sh -c 'while true; do echo x >> " + sentinel + "; touch " + started + "; sleep 0.05; done' & sleep 60"
+	return planapi.CommonInstruction{Name: name, Command: "sh", Args: []string{"-c", script}}
+}
+
+// cancelDuringInstruction runs a single-instruction plan, waits for started to appear, closes
+// Cancel, and returns the ApplyOutput. Shared by the process-tree termination tests below.
+func cancelDuringInstruction(t *testing.T, checksum string, instruction planapi.CommonInstruction, started string) (ApplyOutput, time.Duration) {
+	t.Helper()
+
+	a := newTestApplyinator(t, "", false, "", "")
+	plan := planapi.Plan{OneTimeInstructions: []planapi.OneTimeInstruction{{CommonInstruction: instruction}}}
+
+	cancel := make(chan struct{})
+	begun := time.Now()
+	results := applyAsync(a, ApplyInput{
+		CalculatedPlan:             CalculatedPlan{Plan: plan, Checksum: checksum},
+		RunOneTimeInstructions:     true,
+		OneTimeInstructionAttempts: 1,
+		Cancel:                     cancel,
+	})
+
+	waitForPath(t, started, 30*time.Second)
+	close(cancel)
+
+	// 20s bound rather than a tight one: the watchdog's escalation path can legitimately take
+	// instructionTerminationGrace (10s) before the kill, and this must not be flaky on a loaded
+	// machine. It is still far inside the 60s an unterminated instruction would take.
+	return awaitApply(t, results, 20*time.Second), time.Since(begun)
+}
+
+func TestApplyCancelSendsSIGTERMBeforeKilling(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires a POSIX shell")
+	}
+	t.Parallel()
+
+	// Signal files live outside the work directory because Apply wipes the work directory.
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "term-received")
+	started := filepath.Join(dir, "started")
+
+	output, _ := cancelDuringInstruction(t, "checksum-cancel-sigterm", trappingCommand("trapper", marker, started), started)
+
+	// The trap has run by the time Apply returns, but poll anyway so this never depends on the
+	// exact interleaving of the shell's exit and cmd.Wait() returning.
+	waitForPath(t, marker, 5*time.Second)
+
+	if output.Interruption != InterruptionCanceled {
+		t.Errorf("expected %q, got %q", InterruptionCanceled, output.Interruption)
+	}
+}
+
+func TestApplyCancelKillsTheInstructionsGrandchildren(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires a POSIX shell")
+	}
+	t.Parallel()
+
+	dir := t.TempDir()
+	sentinel := filepath.Join(dir, "grandchild-writes")
+	started := filepath.Join(dir, "started")
+
+	instruction := backgroundedWriterCommand("backgrounder", sentinel, started)
+	output, _ := cancelDuringInstruction(t, "checksum-cancel-grandchild", instruction, started)
+
+	if output.Interruption != InterruptionCanceled {
+		t.Errorf("expected %q, got %q", InterruptionCanceled, output.Interruption)
+	}
+	// The grandchild appends every 50ms, so a full second of a static file size means it is gone
+	// rather than merely descheduled.
+	assertFileStopsGrowing(t, sentinel, time.Second)
+}
+
+func TestApplyCancelReturnsPromptlyWhenAGrandchildHoldsThePipes(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires a POSIX shell")
+	}
+	t.Parallel()
+
+	dir := t.TempDir()
+	sentinel := filepath.Join(dir, "grandchild-writes")
+	started := filepath.Join(dir, "started")
+
+	instruction := backgroundedWriterCommand("backgrounder", sentinel, started)
+	_, elapsed := cancelDuringInstruction(t, "checksum-cancel-pipes", instruction, started)
+
+	// execute() calls eg.Wait() before cmd.Wait(), and eg.Wait() only returns once both pipes hit
+	// EOF. A surviving grandchild holds the write ends, so an implementation that only signals the
+	// direct child blocks here for the parent's full 60s sleep.
+	if elapsed > 30*time.Second {
+		t.Errorf("expected Apply to return well inside the instruction's 60s sleep, took %s", elapsed)
+	}
+}
+
+func TestWatchForTerminationStopIsIdempotent(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name            string
+		alreadyCanceled bool
+	}{
+		{name: "context still open", alreadyCanceled: false},
+		{name: "context already canceled", alreadyCanceled: true},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			if tc.alreadyCanceled {
+				cancel()
+			}
+
+			// Deliberately never started: every platform helper has to tolerate a nil Process
+			// rather than panicking a root daemon.
+			stop := watchForTermination(ctx, exec.Command("true"))
+
+			returned := make(chan struct{})
+			go func() {
+				defer close(returned)
+				stop()
+				stop()
+			}()
+
+			select {
+			case <-returned:
+			case <-time.After(5 * time.Second):
+				t.Fatal("stop() did not return: it must be idempotent and must not block on the termination grace period")
+			}
+		})
+	}
 }
