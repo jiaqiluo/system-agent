@@ -14,20 +14,22 @@ node side:
   incident) and later resume from where it stopped rather than re-running the whole plan.
 
 Both are signaled by annotations on the plan Secret (`plan.cattle.io/cancelled: "true"`,
-`plan.cattle.io/paused: "true"`). The hard part is that `Applyinator.Apply` runs synchronously
+`plan.cattle.io/paused: "true"`; the only other valid value is `"false"`, and anything else is an
+error the operator has to correct). The hard part is that `Applyinator.Apply` runs synchronously
 inside the `OnChange` handler with `DefaultWorkers: 1`, so while an apply is in flight the
 controller cannot deliver the annotation change. Detecting an interruption mid-apply needs a
 separate observer, and stopping cleanly needs the applyinator to grow interruption points.
 
 **Outcome:** an operator can cancel or pause a plan at any point in its lifecycle; the agent stops,
-reports the resulting state in the Secret, and — when the operator removes the annotation — resumes
+reports the resulting state in the Secret, and — when the operator clears the annotation — resumes
 a paused plan at the first instruction that has not yet completed, including when an agent restart,
 crash or upgrade intervened while the plan was held.
 
-Resuming is triggered by exactly one event: **the operator removing the annotation.** Nothing else
-resumes a plan — not a restart, not a crash, not the periodic re-enqueue, not the plan-state flow's
-own crash-recovery rule. See "The suppression invariant" below; it is the safety property this
-feature exists to provide, and the design is arranged so that no code path can violate it.
+Resuming is triggered by exactly one event: **the operator clearing the annotation**, by deleting
+it or by setting it to `"false"` — the two are indistinguishable to the agent. Nothing else resumes
+a plan — not a restart, not a crash, not the periodic re-enqueue, not the plan-state flow's own
+crash-recovery rule. See "The suppression invariant" below; it is the safety property this feature
+exists to provide, and the design is arranged so that no code path can violate it.
 
 The two controls stop at different granularity, and the difference is load-bearing:
 
@@ -52,13 +54,13 @@ survives a crash intact: an interrupted *execution* still re-runs from the begin
 | Paused representation                 | New non-terminal plan-state value `paused`                                                                                                                                                                             |
 | Resume semantics                      | Checkpoint the instruction index in the Secret; completed instructions are not re-run                                                                                                                                  |
 | Checkpoint durability                 | Independent of the agent process. Keyed to the plan checksum alone, so it survives restart, crash and agent upgrade                                                                                                    |
-| Restart while a plan is paused        | Never executes — nothing at all runs while the annotation is set, whatever the plan-state or checkpoint says. Only the operator removing the annotation resumes the plan, and then at the first incomplete instruction |
+| Restart while a plan is paused        | Never executes — nothing at all runs while the annotation is set, whatever the plan-state or checkpoint says. Only the operator clearing it resumes the plan, and then at the first incomplete instruction              |
 | Restart while a plan is *executing*   | Unchanged crash-recovery contract: `in-progress` with no suspended checkpoint re-executes from instruction 0                                                                                                           |
 | Stopping a running instruction        | Cancel only. SIGTERM → SIGKILL after 10s, to the whole **process group** (Windows: Job Object terminate)                                                                                                               |
 | Pause granularity                     | Instruction boundary only; never interrupts a running instruction                                                                                                                                                      |
 | Probes during an interrupt            | Keep running. An interrupt suppresses *execution*, never *observation*                                                                                                                                                 |
 | Writing the interrupted outcome       | Fresh read-modify-write against the API server, never a merge from the stale in-hand copy                                                                                                                              |
-| Dependence on the `paused` wire state | None. The checkpoint is self-describing, so `paused` can be suppressed by config without losing pause or resume                                                                                                        |
+| Valid annotation values               | Exactly `"true"` and `"false"`; absent means `"false"`. Any other value is a configuration error: the plan neither runs nor is interrupted until an operator corrects it                                               |
 | Scope                                 | Remote mode (`pkg/k8splan`) only — annotations are a Secret concept; `pkg/localplan` is unaffected                                                                                                                     |
 
 ## Wire format additions
@@ -71,11 +73,12 @@ New constants in `pkg/k8splan/watcher.go`:
 
 // PlanCancelledAnnotation, set to "true" on the plan Secret, requests that the agent abort the plan.
 // Removing it does not un-cancel: the plan is terminal and waits for new content.
+// The only valid values are "true" and "false"; see readInterrupt.
 PlanCancelledAnnotation = "plan.cattle.io/cancelled"
 // PlanPausedAnnotation, set to "true" on the plan Secret, requests that the agent hold execution.
-// While it is present the agent executes nothing for this plan, whatever plan-state or the resume
-// checkpoint say; removing it is the only thing that resumes the plan. Read fail-closed, so a
-// value that is neither absent nor an explicit false holds the plan — see readInterrupt.
+// While it is set the agent executes nothing for this plan, whatever plan-state or the resume
+// checkpoint say; clearing it is the only thing that resumes the plan.
+// The only valid values are "true" and "false"; see readInterrupt.
 PlanPausedAnnotation = "plan.cattle.io/paused"
 // PlanProgressKey is the Secret data key holding the resume checkpoint (JSON, see planProgress).
 PlanProgressKey = "plan-progress"
@@ -173,9 +176,16 @@ instructions of a single apply; see "Remaining risks" item 4 for where it stops 
 
 ### The suppression invariant
 
-> **While `plan.cattle.io/paused` (or `plan.cattle.io/cancelled`) is set on the Secret, the agent
-> does not execute the plan. Full stop — no matter what `plan-state` says, no matter what the
-> checkpoint says, no matter how the agent arrived at this reconcile.**
+> **The agent executes a plan only when both `plan.cattle.io/paused` and `plan.cattle.io/cancelled`
+> are unambiguously not set — absent, or present with the value `"false"`. Anything else stops
+> execution. Full stop — no matter what `plan-state` says, no matter what the checkpoint says, no
+> matter how the agent arrived at this reconcile.**
+
+Note the shape of that statement: it is a whitelist of the two ways a plan is permitted to run, not
+a blacklist of the ways it is held. A value the agent does not recognise falls on the *stop* side by
+construction rather than by an explicit rule, which is what makes the invariant hold for values
+nobody anticipated. What such a value additionally does — see "Invalid annotation values" below —
+is report an error; what it does not do, ever, is let the plan proceed.
 
 Every other rule in this document is subordinate to that one. It is stated separately because the
 dangerous failure mode is not "pause does not work" — an operator notices that immediately — but
@@ -184,10 +194,11 @@ minutes or hours after the operator walked away, and is exactly the situation pa
 prevent.
 
 The invariant is upheld structurally rather than by remembering to check for it: `readInterrupt` is
-evaluated at the top of the reconcile, and the interrupt branch **returns**. Everything capable of
-starting work — `resolveResume`, the resume commit, `decidePlanStateAction`, the
-`pending → in-progress` pre-commit, `Apply` — sits below that return and therefore runs only when
-`interrupt == InterruptionNone`. There is no ordering in which a suspended plan reaches them.
+evaluated at the top of the reconcile, and both the interrupt branch and the invalid-value branch
+**return**. Everything capable of starting work — `resolveResume`, the resume commit,
+`decidePlanStateAction`, the `pending → in-progress` pre-commit, `Apply` — sits below those returns
+and therefore runs only when `readInterrupt` reported no error and `InterruptionNone`. There is no
+ordering in which a suspended plan reaches them.
 
 Three consequences worth naming, because each is a plausible bug that this ordering rules out:
 
@@ -200,10 +211,58 @@ Three consequences worth naming, because each is a plausible bug that this order
   carries the annotation is inert.
 - **No configuration can weaken it.** The suppression decision reads the annotation and nothing
   else — not `plan-state`, not the checkpoint, not any config field. There is deliberately no
-  setting that turns pause off; an operator who wants the plan to run removes the annotation.
+  setting that turns pause off; an operator who wants the plan to run clears the annotation.
 
-Resuming has exactly one trigger — the operator removing the annotation — and the reconcile that
-observes the removal is the only one that may execute.
+Resuming has exactly one trigger — the operator clearing the annotation, by removing it or by
+setting it to `"false"` — and the reconcile that observes the change is the only one that may
+execute. The two forms are indistinguishable to the agent and are treated identically everywhere in
+this document; "removing the annotation" is shorthand for both.
+
+### Invalid annotation values
+
+The only valid values are `"true"` and `"false"`. An absent annotation is `"false"`. Everything else
+— `"True"`, `"1"`, `"yes"`, `""`, a stray trailing space — is a **configuration error**, not a
+request, and the operator has to correct it.
+
+The agent's response to one is deliberately narrow. It:
+
+- **executes nothing.** This is the suppression invariant, which does not distinguish an invalid
+  value from `"true"`;
+- **interrupts nothing.** An invalid value is not a pause request and not a cancel request. An apply
+  already in flight runs to completion; no process is killed, no checkpoint is written, `plan-state`
+  is not moved;
+- **writes nothing to the Secret.** No `plan-state`, no checkpoint, not even probe statuses on this
+  path — the agent has been handed input it cannot interpret and does not respond by editing the
+  object. `resourceVersion` is therefore stable for the whole time the error persists, which also
+  means the error cannot amplify into a write loop;
+- **reports.** `logrus.Errorf` naming the annotation, the offending value and the two accepted ones,
+  and `reconcileSecret` returns the error so the workqueue retries under its existing exponential
+  rate limiter (1m–5m). Correcting the annotation arrives as a watch event and is picked up
+  immediately; the backoff is only the floor.
+
+Do nothing, say so loudly, retry cheaply. The reason the response is not richer — no `plan-state:
+failed`, no invented error key — is that `failed` means "the instructions ran and did not succeed",
+which is a claim about the node. Nothing ran. Overloading it would make a typo indistinguishable
+from a broken installer in every downstream consumer, and would trip failure-count and max-failures
+machinery on a plan that was never attempted.
+
+One exception, and it is the emergency-stop one. Precedence is:
+
+1. `plan.cattle.io/cancelled == "true"` → **cancel**, even if the other annotation's value is
+   invalid. An operator stopping a runaway installer is not made to fix a typo on an unrelated
+   annotation first. The invalid value is still logged.
+2. Otherwise, either value invalid → the error path above.
+3. Otherwise, `plan.cattle.io/paused == "true"` → **pause**.
+4. Otherwise → execute.
+
+Steps 1 and 3 are the existing "cancel wins over pause" rule; the ordering above just says where
+validation sits relative to it. Note that an invalid *cancel* value does not permit a valid pause to
+take effect — pause is the weaker request, and honoring it while the stronger one is unreadable
+would let the agent act on a guess about what the operator meant.
+
+The right long-term fix is upstream of the agent: if Rancher exposes pause and cancel as a UI action
+or API field, only the two valid values are constructible and this path is unreachable. It exists
+for the `kubectl annotate` escape hatch. See "Proposed changes in rancher/rancher" items 6 and 10.
 
 ### Execution versus observation
 
@@ -215,6 +274,12 @@ exactly the nodes most likely to be unhealthy (a plan canceled mid-flight leaves
 partial state). Reporting honestly is the safer default, and it costs nothing: `applyProbeResult`
 saturates its counters at the success/failure threshold, so a steady-state probe produces identical
 Secret data and the existing `reflect.DeepEqual` guard suppresses the write.
+
+The invalid-value path is the one exception, and it is not really an exception to this rule: an
+invalid value is not an interrupt at all, so there is nothing to observe *about* — the reconcile
+never reaches the point where it has decided what is happening to the plan. It returns the error
+and touches nothing, probes included. Probes resume the moment the value is corrected, at which
+point the plan is either held (and observed) or running.
 
 On top of that:
 
@@ -304,12 +369,13 @@ At the top of the reconcile, after `currentPlanState` is read:
 ```go
 // resolveResume maps a stored plan-state onto the state the reconcile should act on. A plan is
 // treated as suspended if plan-state says so *or* if a valid checkpoint claims it — the latter is
-// what keeps resume working when the paused wire state is disabled, and what keeps it working
-// across an agent restart. Every other state passes through unchanged with resumeFrom 0.
+// what keeps resume working across an agent restart, and when an external write has moved
+// plan-state out from under a checkpoint. Every other state passes through unchanged with
+// resumeFrom 0.
 //
-// Precondition: the caller has already established that no interrupt annotation is set. This
-// function describes how to *leave* a suspension, never whether to; a plan that is still annotated
-// never reaches it.
+// Precondition: the caller has already established that both interrupt annotations read as an
+// explicit false. This function describes how to *leave* a suspension, never whether to; a plan
+// that is still held — or whose annotation could not be parsed — never reaches it.
 func resolveResume(state planapi.PlanState, data map[string][]byte, checksum string) (planapi.PlanState, int) {
     if state == "" { // checksum flow: no checkpoint is ever written, nothing to resolve
         return state, 0
@@ -591,15 +657,41 @@ grace also fits comfortably inside the default `TimeoutStopSec` of 90s, since th
 
 New `pkg/k8splan/interrupt.go`:
 
-- `readInterrupt(annotations map[string]string) applyinator.Interruption` — pure; cancel takes
-  precedence. The value is parsed **fail-closed**: `strconv.ParseBool` decides, and a present but
-  unparseable value (`"True"`, `"yes"`, `"1"`, `""`) is treated as *set* and logged at warn. Only
-  an absent annotation, or one that parses as false, permits execution. The asymmetry is
-  deliberate — misreading the annotation in the permissive direction runs a plan an operator
-  believed was held, which is the one outcome the suppression invariant exists to prevent, while
-  misreading it in the restrictive direction merely holds a plan the operator can release by
-  removing the annotation. (`strconv.ParseBool` already accepts `"True"` and `"1"`; the fail-closed
-  rule covers everything it rejects.)
+- `readInterrupt(annotations map[string]string) (applyinator.Interruption, error)` — pure, and the
+  single place either annotation is interpreted:
+
+  ```go
+  // parseInterruptAnnotation reports whether key requests its interrupt. The only valid values are
+  // "true" and "false"; an absent annotation is "false". Any other value is an operator
+  // misconfiguration and is returned as an error — never silently coerced in either direction.
+  func parseInterruptAnnotation(annotations map[string]string, key string) (bool, error) {
+      v, ok := annotations[key]
+      if !ok {
+          return false, nil
+      }
+      switch v {
+      case "true":
+          return true, nil
+      case "false":
+          return false, nil
+      default:
+          return false, fmt.Errorf("annotation %s has invalid value %q, must be \"true\" or \"false\"", key, v)
+      }
+  }
+  ```
+
+  `readInterrupt` calls it for both keys and applies the precedence from "Invalid annotation values":
+  a valid `cancelled == "true"` returns `InterruptionCanceled` with a nil error even when the pause
+  value is invalid; otherwise any error is returned and the `Interruption` is meaningless to the
+  caller; otherwise a valid `paused == "true"` returns `InterruptionPaused`; otherwise
+  `InterruptionNone`. Errors from both keys are joined with `errors.Join` so a doubly-mistyped
+  Secret reports both in one message rather than one per reconcile.
+
+  Deliberately **not** `strconv.ParseBool`: it accepts `"True"`, `"TRUE"`, `"t"`, `"1"`, `"0"` and
+  friends, so it would quietly accept eleven spellings of each value and reject the twelfth. The
+  point of an exact match is that the accepted set is the set that can be written down in
+  documentation and validated by an admission check — one spelling each, and everything else is
+  visibly wrong at the moment it is set rather than subtly wrong later.
 - `interruptWatch` + `(w *watcher) startInterruptWatch(ctx, sc)` — a goroutine polling every
   `interruptPollInterval` (2s) that closes `Cancel`/`Pause` the first time the matching annotation
   is observed. It reads `sc.Cache().Get(ns, name)` (the informer's indexer is updated by its own
@@ -607,6 +699,16 @@ New `pkg/k8splan/interrupt.go`:
   falling back to `sc.Get(...)` if the cache read errors. Cache objects are shared and must be
   treated as read-only — the watch only reads `Annotations` and never mutates or retains the
   object. Started around the `Apply` call and stopped via `defer`.
+
+  It calls the same `readInterrupt`, so validity is decided in one place, but its response to an
+  error differs: it closes nothing and lets the apply continue, rate-limiting the log to once per
+  watch rather than every 2s. Interrupting an in-flight apply is destructive — for cancel,
+  irreversibly so — and doing it on input the agent could not parse would be acting on a guess. The
+  entry path can afford to be strict because refusing to *start* costs nothing; the watch cannot,
+  so an invalid value that appears mid-apply is reported and otherwise ignored until the operator
+  corrects it, at which point the next poll sees a value it understands. This is the one place the
+  two paths diverge, and the divergence is between "do not start" and "do not kill" — never between
+  "hold" and "run".
 - `handleInterrupt(...)` — the reconcile-entry path: emits the decision logs and computes the
   `plan-state`/`plan-progress` updates per the rules above, returning an empty update map when the
   state is already what it would write.
@@ -658,8 +760,15 @@ outcome `Update` is guaranteed to 409. Consequences under the original design:
 
 1. Existing preamble, unchanged, through `CalculatePlan`, `parseProbeStatuses`, `currentPlanState`
    and `parseFailureCount`.
-2. `interrupt := readInterrupt(secret.Annotations)`. If set — **unconditionally, before any state is
-   resolved and before any decision to execute is taken**:
+2. `interrupt, err := readInterrupt(secret.Annotations)` — **unconditionally, before any state is
+   resolved and before any decision to execute is taken**.
+
+   If `err != nil`: `logrus.Errorf` the message and `return secret, err`. No Secret write, no
+   probes, no `Apply`, no `EnqueueAfter` — the workqueue's own rate limiter owns the retry. This is
+   the shortest branch in the reconcile and it comes first, because "the input cannot be
+   interpreted" has to be settled before anything reads that input.
+
+   Otherwise, if `interrupt != InterruptionNone`:
    - `handleInterrupt` computes the state updates (possibly none),
    - lifecycle-key writes (`plan-state`, `plan-progress`) are gated on `UsesPlanState`; in checksum flow this path writes probe status (and any non-lifecycle output keys) only,
    - `prober.DoProbes(cp.Plan.Probes, probeStatuses, false)` runs and the marshaled statuses join
@@ -667,11 +776,11 @@ outcome `Update` is guaranteed to 409. Consequences under the original design:
    - one `writeInterruptOutcome` call persists both,
    - `sc.EnqueueAfter(..., interruptedEnqueuePeriod)`; **return**.
 
-   This return is the enforcement point for the suppression invariant, and it is why steps 3-8 need
-   no interrupt handling of their own: they are unreachable while an annotation is set. Worth a
-   comment in the code saying so, because the branch looks like an early-exit optimisation and is
-   in fact a safety property.
-3. Everything below here runs only when `interrupt == InterruptionNone`.
+   Those two returns are the enforcement point for the suppression invariant, and they are why
+   steps 3-8 need no interrupt handling of their own: they are unreachable unless both annotations
+   read as an explicit false. Worth a comment in the code saying so, because the branches look like
+   early-exit optimisations and are in fact a safety property.
+3. Everything below here runs only when `err == nil && interrupt == InterruptionNone`.
    `effectiveState, resumeFrom := resolveResume(currentPlanState, secret.Data, cp.Checksum)`.
    Every downstream use of `currentPlanState` becomes `effectiveState`, including `UsesPlanState`
    in `applyOutcomeInput`.
@@ -745,6 +854,12 @@ today's Rancher — verified" above. What is left is not verifiable by reading c
    but worth a Rancher-side alert or a max-pause-duration policy. A durable checkpoint extends the
    window in which this can go unnoticed: the hold now survives node reboots and agent upgrades, so
    it will not quietly resolve itself the way a process-scoped one eventually did.
+
+   A mistyped value stalls the plan the same way and is *more* likely to be forgotten, because the
+   operator who set it believes they either paused the node or did nothing — not that they left it
+   wedged. The agent logs it every reconcile, but that is on the node. This is the reason item 10
+   is in the Rancher list rather than filed as a nicety: the annotation reaper, the stall alert and
+   the invalid-value report all want the same Rancher-side inspection of the same two keys.
 4. **A durable checkpoint asserts history, not present state.** `Completed` records that
    instructions ran to completion, not that their effects still exist. Within a node's lifetime that
    is the same assumption the applyinator already makes between two instructions of a single apply,
@@ -759,8 +874,9 @@ today's Rancher — verified" above. What is left is not verifiable by reading c
 ## Proposed changes in rancher/rancher
 
 The agent side is complete without any of this — the states are inert against today's planner. What
-these buy is (a) an operator-legible reason for a stalled rollout, (b) a way back from a cancel and
-(c) not offering a control on a node that cannot honor it. Line references are against `73d6cd578`.
+these buy is (a) an operator-legible reason for a stalled rollout, (b) a way back from a cancel,
+(c) not offering a control on a node that cannot honor it and (d) not letting an invalid annotation
+value reach the node in the first place. Line references are against `73d6cd578`.
 
 ### 1. Upstream the wire constants — `pkg/plan/state.go`
 
@@ -774,6 +890,8 @@ copies:
 PlanStatePaused PlanState = "paused"
 
 // PlanCancelledAnnotation / PlanPausedAnnotation request that the agent abort or hold the plan.
+// The only valid values are "true" and "false"; an absent annotation is "false". The agent rejects
+// anything else rather than guessing, so producers must not write other spellings.
 PlanCancelledAnnotation = "plan.cattle.io/cancelled"
 PlanPausedAnnotation    = "plan.cattle.io/paused"
 
@@ -851,6 +969,11 @@ on the machine, or a documented `kubectl annotate` is a product question. The ag
 annotations as operator-owned and never edits them, so any of the three works, and a documented
 `kubectl annotate` is enough to ship the pause half.
 
+The valid values are exactly `"true"` and `"false"`. A UI action or API field makes anything else
+unconstructible, which is the argument for one; the `kubectl annotate` route is the only one that
+can produce the invalid-value error path described above, so if that is what ships first the
+accepted values belong in the documented command, not just in the reference.
+
 One constraint on the shape: the annotations must be set **on the plan Secret**. Setting them on
 the `Machine` and expecting them to reach the Secret does not work — `CopyPlanMetadataToSecret`
 filters on `labelAnnotationMatch` = `^((rke\.cattle\.io)|((?:machine\.)?cluster\.x-k8s\.io))/`
@@ -903,13 +1026,37 @@ superseded plan is already ignored by the agent. But leaving it in the Secret me
 describe` shows a progress record that does not describe the current plan, which is exactly the
 kind of thing someone debugging a stuck rollout will believe.
 
+### 10. Validate the annotation values, and surface an invalid one
+
+The agent refuses to act on a value other than `"true"` or `"false"` and returns an error, but its
+only channel for saying so is its own log. From Rancher the machine simply stops progressing — the
+same silent-hazard shape as item 8. Two halves, either useful alone:
+
+- **Reject at the source.** If items 6's UI action or API field lands, validate there. If the
+  annotation stays operator-set, a validating admission webhook on the plan Secret is the place —
+  the value is wrong at the instant it is written, and that is the only moment the operator is
+  still looking.
+- **Report it if it gets through.** `getPlanStatusReasonMessage` (item 3) and the `plansecret`
+  condition (item 4) already exist to explain a stalled rollout, and the annotation is on the object
+  they are handed, so the check is local: if either annotation is present with a value that is
+  neither `"true"` nor `"false"`, report that instead of `waiting for plan to be applied`. This
+  needs nothing from the agent — Rancher can revalidate the same two strings independently, which
+  is also why the two implementations must agree exactly, and why the accepted set is two literals
+  rather than a parser.
+
+Worth doing even though the path should be unreachable once the source validates: the escape hatch
+is `kubectl annotate` on a Secret, and nothing prevents that.
+
 ### Suggested sequencing
 
 Items 1-4 are additive, independently mergeable, and carry no behaviour change for existing plans;
 they can land before or after the agent work in any order. Item 5 changes planner behaviour and
 should land before cancel is exposed to operators. Item 6 gates any of this being reachable from
 the UI, and **item 8 gates it being reachable safely** — item 6 without item 8 ships a control that
-silently does nothing on a node mid-upgrade. Item 9 is cosmetic and can land whenever.
+silently does nothing on a node mid-upgrade. Item 10's first half rides along with item 6 (validate
+wherever the value is set) and its second half with items 3-4 (report it wherever a stall is
+already explained), so it costs little if taken with them and is awkward to retrofit later. Item 9
+is cosmetic and can land whenever.
 
 ## Tests
 
@@ -930,9 +1077,26 @@ silently does nothing on a node mid-upgrade. Item 9 is cosmetic and can land whe
 - A script that backgrounds a child writing to a sentinel file proves the **grandchild** is also
   killed — the specific regression the process-group work exists to prevent.
 
-`pkg/k8splan/plan_decision_test.go`: `readInterrupt` table — precedence of cancel over pause, plus
-the fail-closed rows: `"true"`/`"True"`/`"1"` set, `"yes"`/`""`/`"maybe"` set with a warning,
-`"false"`/`"0"` and an absent annotation not set. (No `Halt` case; the flag is gone.)
+`pkg/k8splan/interrupt_test.go`, `readInterrupt` table — the accepted set and the precedence rules,
+asserting the returned `Interruption` *and* whether an error came back:
+
+| `cancelled` | `paused`  | result                                                        |
+|-------------|-----------|---------------------------------------------------------------|
+| absent      | absent    | `InterruptionNone`, nil                                       |
+| `"false"`   | `"false"` | `InterruptionNone`, nil — the explicit-false form             |
+| absent      | `"true"`  | `InterruptionPaused`, nil                                     |
+| `"true"`    | absent    | `InterruptionCanceled`, nil                                   |
+| `"true"`    | `"true"`  | `InterruptionCanceled`, nil — cancel wins                     |
+| `"true"`    | `"yes"`   | `InterruptionCanceled`, nil — a valid cancel is never blocked |
+| `"True"`    | absent    | error — case matters                                          |
+| `"1"`       | absent    | error — `ParseBool` spellings are rejected on purpose         |
+| absent      | `""`      | error — present-and-empty is not absent                       |
+| `"maybe"`   | `"nope"`  | error mentioning **both** keys (`errors.Join`)                |
+| `"nope"`    | `"true"`  | error — an invalid cancel does not let a valid pause through  |
+
+The `"True"` and `"1"` rows are the ones that would silently pass under a `ParseBool`
+implementation, and the `"nope"`/`"true"` row is the one that would silently pause under a
+per-annotation "first valid wins" implementation. (No `Halt` case; the flag is gone.)
 
 `pkg/k8splan/plan_progress_test.go`: round-trip; checksum mismatch → zero value; malformed JSON; a
 `Paused: false` record (a cancel report) yields `resumeFrom` 0; a `paused` wire state with no
@@ -966,12 +1130,20 @@ every row that **`Apply` is never called** and no instruction sentinel file appe
 Every row carries `plan.cattle.io/paused: "true"`, and the rows are chosen so that at least one
 would execute if the annotation check were moved below `resolveResume`, below
 `decidePlanStateAction`, or below the checksum comparison — `in-progress` re-executes on restart,
-`pending` starts, and the checksum-flow row applies on mismatch. A parallel row set with an
-unparseable annotation value (`"True"`, `"yes"`, `""`) asserts the fail-closed read.
+`pending` starts, and the checksum-flow row applies on mismatch.
 
 The rows whose suspension is already recorded additionally assert **zero `Update` calls** — the
 write-once guard honoring a checkpoint the current process did not write — and the row with no
 checkpoint asserts exactly one, recording the suspension for the first time.
+
+The same matrix runs a second time with the value replaced by an invalid one (`"True"`, `"yes"`,
+`""`), asserting the stricter outcome: `Apply` never called, **and zero `Update` calls on every
+row** including the ones that would otherwise record a suspension, **and** a non-nil error from
+`reconcileSecret`. That last assertion is the one that distinguishes this revision from a
+fail-closed read — a typo must not be able to masquerade as a working pause, so it is not enough
+that the plan is held; the reconcile has to say something is wrong. A third pass asserts the
+`resourceVersion` is byte-identical before and after, which is how "writes nothing" is checked
+rather than inferred from the `Update` count.
 
 Then the resume half:
 
@@ -986,6 +1158,14 @@ Then the resume half:
   either no checkpoint or one left at `Paused: false` by a resume commit. Assert
   `ResumeFromOneTimeInstruction` is 0 — the crash-recovery contract is unchanged for plans that were
   running rather than held, and a cancel report is never mistaken for a resume point.
+- **`"false"` resumes exactly like removal.** The same fixture as the first case, but the operator
+  sets `plan.cattle.io/paused: "false"` instead of deleting the key. Assert the resulting Secret is
+  equal to the one the removal case produces. Written as a shared table over both release forms
+  rather than a copied test, so the two cannot drift.
+- **A corrected value self-heals.** Reconcile with `plan.cattle.io/paused: "yes"` and assert the
+  error; reconcile again with the value corrected to `"true"` and assert the suspension is recorded
+  normally, then again with `"false"` and assert the resume commit fires. The point is that the
+  error path leaves no residue — no half-written state for the corrected reconcile to trip over.
 
 Plus one for the exit path itself:
 
@@ -1014,13 +1194,22 @@ Four cases exist specifically for the defects this revision fixes, and should be
   `plan-state` already `paused`. Assert exactly one `Update` call across both reconciles and that
   `plan-progress` still reports the original `Completed`, not 0.
 
-`pkg/k8splan/interrupt_test.go`: `fake.MockCacheInterface[*corev1.Secret]` wired through
-`MockControllerInterface.EXPECT().Cache()`, returning the annotation on the second poll; assert the
-channel closes and that a cache error falls back to `sc.Get`.
+`pkg/k8splan/interrupt_test.go`, the watch half: `fake.MockCacheInterface[*corev1.Secret]` wired
+through `MockControllerInterface.EXPECT().Cache()`, returning the annotation on the second poll;
+assert the channel closes and that a cache error falls back to `sc.Get`. Plus the divergence from
+the entry path — a poll returning `plan.cattle.io/paused: "yes"` closes **neither** channel and the
+watch keeps polling, and a subsequent poll returning `"true"` closes `Pause` normally. Without this
+case, "the watch ignores invalid values" is a sentence in a design document rather than a
+behaviour.
 
 ### E2E (`test/e2e/suites/remote-plan/`, build tag `e2e`, `short` label)
 
 - New `test/framework/secret.go` helpers `SetSecretAnnotation` / `RemoveSecretAnnotation`.
+- `pause_test.go`, invalid-value spec: set `plan.cattle.io/paused: "True"` on a pending plan and
+  assert the plan does not advance, the Secret's `resourceVersion` is unchanged after a settle
+  period, and `plan-state` is still `pending`; then correct the value to `true` and assert the hold
+  is recorded. Cheap, and it is the one assertion that catches a real API server behaving
+  differently from the fake client on "the agent wrote nothing".
 - `cancellation_test.go`: cancel a plan whose first instruction sleeps → `plan-state` reaches
   `cancelled`, the later instruction's file never appears, `plan-progress` shows partial execution;
   cancel a pending plan → no side effects at all.
@@ -1039,9 +1228,10 @@ channel closes and that a cache error falls back to `sc.Get`.
 ### Docs
 
 Add a "Cancellation and pause" paragraph to the `pkg/k8splan` section of `CLAUDE.md`, leading with
-the suppression invariant — while the annotation is set nothing executes, and only its removal
-resumes the plan — then the execution-vs-observation rule and the pause-is-a-boundary semantics. It
-also needs to qualify the
+the suppression invariant — a plan runs only when both annotations are absent or `"false"`, and
+clearing the annotation is the only thing that resumes it — then the accepted values (`"true"` and
+`"false"`, everything else an error), the execution-vs-observation rule and the pause-is-a-boundary
+semantics. It also needs to qualify the
 crash-recovery sentence already there — "`in-progress` on startup → re-apply" — with the pause
 exception: a plan held by the pause annotation is not re-applied on startup, and a suspended
 checkpoint is honored across agent lifetimes so the eventual unpause resumes rather than restarts.
@@ -1053,7 +1243,7 @@ checkpoint is honored across agent lifetimes so the eventual unpause resumes rat
 | `pkg/applyinator/applyinator.go`                        | `Interruption`, `checkInterruption`, input/output fields, start index and channel checks in both instruction loops, pre-lock short-circuit, `watchForTermination` in `execute` |
 | `pkg/applyinator/process_unix.go`, `process_windows.go` | new — process-group / Job Object setup and tree termination                                                                                                                    |
 | `pkg/k8splan/watcher.go`                                | new constants, `secretConflictMergeKeys` entry and absent-key fix                                                                                                              |
-| `pkg/k8splan/interrupt.go`                              | new — `readInterrupt`, `interruptWatch`, `handleInterrupt`, `writeInterruptOutcome` (used for both entering and leaving an interrupt)                                          |
+| `pkg/k8splan/interrupt.go`                              | new — `parseInterruptAnnotation`, `readInterrupt`, `interruptWatch`, `handleInterrupt`, `writeInterruptOutcome` (used for both entering and leaving an interrupt)              |
 | `pkg/k8splan/plan_progress.go`                          | new — checkpoint parse/marshal, `resolveResume`                                                                                                                                |
 | `pkg/k8splan/reconcile.go`                              | interrupt entry path, effective-state resolution, resume commit, interrupted outcome path                                                                                      |
 | `pkg/k8splan/secret_outcome.go`                         | clear `plan-progress` on terminal outcomes                                                                                                                                     |
@@ -1096,15 +1286,29 @@ kubectl -n <ns> get secret <machine>-machine-plan -o jsonpath='{.data.plan-progr
 systemctl restart rancher-system-agent
 journalctl -u rancher-system-agent -f      # expect the pause to be re-observed, no apply
 
-kubectl -n <ns> annotate --overwrite secret <machine>-machine-plan plan.cattle.io/paused-
+# release the hold — either form works and both should be tried
+kubectl -n <ns> annotate --overwrite secret <machine>-machine-plan plan.cattle.io/paused=false
+kubectl -n <ns> annotate secret <machine>-machine-plan plan.cattle.io/paused-
 ```
 
 Confirm the state reports `paused`; that the restart re-enters the hold rather than re-running the
 plan, with `plan-progress` reporting the same `completedInstructions` before and after it; that the
-plan reaches `succeeded` after the annotation is removed without re-running completed instructions;
+plan reaches `succeeded` after the annotation is cleared without re-running completed instructions;
 and — the write-amplification check — that the Secret's resourceVersion is stable for the duration
 of the pause rather than incrementing every few seconds. Repeating the unpause with the agent
 stopped (annotate, then `systemctl start`) exercises the resume-on-startup path.
+
+The invalid-value path is worth one manual pass too, because its whole purpose is operator-facing:
+
+```bash
+kubectl -n <ns> annotate --overwrite secret <machine>-machine-plan plan.cattle.io/paused=True
+journalctl -u rancher-system-agent -f      # expect an error naming the key, the value and the two accepted ones
+kubectl -n <ns> get secret <machine>-machine-plan -o jsonpath='{.metadata.resourceVersion}'
+```
+
+Confirm the plan does not advance, the message says what to write instead, and the resourceVersion
+does not move while the bad value sits there — then correct it to `true` and confirm the hold is
+recorded on the very next reconcile with no manual intervention.
 
 For cancel, additionally confirm on the node that no descendant of the killed instruction survives:
 
