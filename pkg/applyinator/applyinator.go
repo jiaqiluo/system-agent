@@ -57,7 +57,10 @@ const defaultFailureCooldown = 6
 
 // instructionTerminationGrace is how long a cancelled instruction's process tree is given to exit
 // after a graceful signal before it is killed outright.
-const instructionTerminationGrace = 10 * time.Second
+//
+// A var rather than a const so that tests can shorten it: the escalation path, which is where the
+// pipe close lives, is otherwise only reachable after a real ten-second wait.
+var instructionTerminationGrace = 10 * time.Second
 
 func NewApplyinator(workDir string, preserveWorkDir bool, appliedPlanDir, interlockDir string, imageUtil *image.Utility) *Applyinator {
 	return &Applyinator{

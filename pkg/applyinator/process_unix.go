@@ -57,6 +57,13 @@ func signalProcessTree(cmd *exec.Cmd, sig syscall.Signal) error {
 	// agent's own pgid. kill(-pgid, SIGKILL) would then deliver the signal to rancher-system-agent
 	// itself and to every other process it started, so cancelling one plan would kill the agent.
 	// Degrading to a direct-child signal is far preferable to a root daemon killing itself.
+	//
+	// Accepted, and deliberately not guarded against: Getpgid and Kill are raw syscalls and so opt
+	// out of the pid-reuse protection os.Process.Signal provides. The watchdog can be inside this
+	// function while cmd.Wait() reaps the child on the other goroutine -- stop() closes done only
+	// afterwards, and then blocks on <-finished -- so a pid recycled in that window would be
+	// signalled instead. It requires wrapping the whole pid space in microseconds; the group-wide
+	// reach that makes the raw syscall necessary is worth more than closing it.
 	pgid, err := syscall.Getpgid(cmd.Process.Pid)
 	if err != nil || pgid != cmd.Process.Pid {
 		return ignoreProcessGone(cmd.Process.Signal(sig))

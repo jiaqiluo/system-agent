@@ -1781,14 +1781,13 @@ func backgroundedWriterCommand(name, sentinel, started string) planapi.CommonIns
 
 // cancelDuringInstruction runs a single-instruction plan, waits for started to appear, closes
 // Cancel, and returns the ApplyOutput. Shared by the process-tree termination tests below.
-func cancelDuringInstruction(t *testing.T, checksum string, instruction planapi.CommonInstruction, started string) (ApplyOutput, time.Duration) {
+func cancelDuringInstruction(t *testing.T, checksum string, instruction planapi.CommonInstruction, started string) ApplyOutput {
 	t.Helper()
 
 	a := newTestApplyinator(t, "", false, "", "")
 	plan := planapi.Plan{OneTimeInstructions: []planapi.OneTimeInstruction{{CommonInstruction: instruction}}}
 
 	cancel := make(chan struct{})
-	begun := time.Now()
 	results := applyAsync(a, ApplyInput{
 		CalculatedPlan:             CalculatedPlan{Plan: plan, Checksum: checksum},
 		RunOneTimeInstructions:     true,
@@ -1799,10 +1798,11 @@ func cancelDuringInstruction(t *testing.T, checksum string, instruction planapi.
 	waitForPath(t, started, 30*time.Second)
 	close(cancel)
 
-	// 20s bound rather than a tight one: the watchdog's escalation path can legitimately take
-	// instructionTerminationGrace (10s) before the kill, and this must not be flaky on a loaded
-	// machine. It is still far inside the 60s an unterminated instruction would take.
-	return awaitApply(t, results, 20*time.Second), time.Since(begun)
+	// This deadline is the real assertion that the apply does not hang: the instructions used here
+	// outlive it by design (sleep 60), so awaitApply fails the test if termination did not work.
+	// 20s rather than a tight bound because the watchdog's escalation path can legitimately take
+	// instructionTerminationGrace before the kill, and this must not be flaky on a loaded machine.
+	return awaitApply(t, results, 20*time.Second)
 }
 
 func TestApplyCancelSendsSIGTERMBeforeKilling(t *testing.T) {
@@ -1816,7 +1816,7 @@ func TestApplyCancelSendsSIGTERMBeforeKilling(t *testing.T) {
 	marker := filepath.Join(dir, "term-received")
 	started := filepath.Join(dir, "started")
 
-	output, _ := cancelDuringInstruction(t, "checksum-cancel-sigterm", trappingCommand("trapper", marker, started), started)
+	output := cancelDuringInstruction(t, "checksum-cancel-sigterm", trappingCommand("trapper", marker, started), started)
 
 	// The trap has run by the time Apply returns, but poll anyway so this never depends on the
 	// exact interleaving of the shell's exit and cmd.Wait() returning.
@@ -1838,7 +1838,7 @@ func TestApplyCancelKillsTheInstructionsGrandchildren(t *testing.T) {
 	started := filepath.Join(dir, "started")
 
 	instruction := backgroundedWriterCommand("backgrounder", sentinel, started)
-	output, _ := cancelDuringInstruction(t, "checksum-cancel-grandchild", instruction, started)
+	output := cancelDuringInstruction(t, "checksum-cancel-grandchild", instruction, started)
 
 	if output.Interruption != InterruptionCanceled {
 		t.Errorf("expected %q, got %q", InterruptionCanceled, output.Interruption)
@@ -1848,24 +1848,150 @@ func TestApplyCancelKillsTheInstructionsGrandchildren(t *testing.T) {
 	assertFileStopsGrowing(t, sentinel, time.Second)
 }
 
-func TestApplyCancelReturnsPromptlyWhenAGrandchildHoldsThePipes(t *testing.T) {
+// recordingCloser stands in for one of execute's stdout/stderr pipes and records whether
+// watchForTermination closed it. Closing the pipes is the watchdog's escalation-only behaviour, so
+// the call count is the only observable difference between the graceful and the escalated path.
+type recordingCloser struct {
+	mu      sync.Mutex
+	closes  int
+	closedA time.Time
+}
+
+func (r *recordingCloser) Close() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.closes++
+	if r.closes == 1 {
+		r.closedA = time.Now()
+	}
+	return nil
+}
+
+func (r *recordingCloser) state() (int, time.Time) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.closes, r.closedA
+}
+
+// startWatchedCommand launches a shell that installs trapAction as its SIGTERM handler and then
+// idles, under the same process-group setup execute uses, and arms a watchdog on it. It returns the
+// cancel func, the recorded pipe, a channel carrying cmd.Wait()'s result, and the watchdog's stop
+// func.
+//
+// It does not return until the trap is demonstrably installed. cmd.Start() returns as soon as
+// fork/exec succeeds, well before sh has parsed the trap, so a test that cancelled immediately
+// would signal a shell still running the *default* SIGTERM disposition: it would die instantly and
+// every case would silently observe the graceful path, whichever handler it asked for.
+func startWatchedCommand(t *testing.T, trapAction string) (context.CancelFunc, *recordingCloser, <-chan error, func()) {
+	t.Helper()
+
+	installed := filepath.Join(t.TempDir(), "trap-installed")
+	script := "trap " + trapAction + " TERM; touch " + installed + "; while true; do sleep 0.02; done"
+
+	cmd := exec.Command("sh", "-c", script)
+	if err := configureProcessGroup(cmd); err != nil {
+		t.Fatalf("configureProcessGroup: %v", err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if err := assignProcessTree(cmd); err != nil {
+		t.Fatalf("assignProcessTree: %v", err)
+	}
+
+	waited := make(chan error, 1)
+	go func() { waited <- cmd.Wait() }()
+
+	waitForPath(t, installed, 30*time.Second)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	pipe := &recordingCloser{}
+	stop := watchForTermination(ctx, cmd, pipe)
+	t.Cleanup(func() {
+		cancel()
+		stop()
+	})
+	return cancel, pipe, waited, stop
+}
+
+// TestWatchForTerminationClosesThePipesOnlyWhenItEscalates pins both halves of the watchdog's pipe
+// handling, which is the one part of it a cancelled Apply cannot observe: on Unix the graceful
+// SIGTERM already reaches the whole process group, so the pipes reach EOF on their own and closing
+// them explicitly makes no observable difference at the Apply level.
+//
+// The two halves matter for different reasons. Closing on escalation is what stops a surviving
+// descendant that inherited the write ends from blocking execute's eg.Wait() forever. NOT closing
+// on the graceful path is what stops a well-behaved instruction's final output being truncated.
+//
+// Not parallel: it rewrites the package-level instructionTerminationGrace, and Go runs every
+// non-parallel test body to completion before resuming any parallel one, so this cannot race with
+// the watchdogs the other tests arm.
+func TestWatchForTerminationClosesThePipesOnlyWhenItEscalates(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("requires a POSIX shell")
 	}
-	t.Parallel()
 
-	dir := t.TempDir()
-	sentinel := filepath.Join(dir, "grandchild-writes")
-	started := filepath.Join(dir, "started")
+	testCases := []struct {
+		name string
+		// trapAction is the command's response to SIGTERM, and is what selects the path under test.
+		trapAction string
+		grace      time.Duration
+		wantClosed bool
+		reason     string
+	}{
+		{
+			name:       "graceful exit leaves the pipes open",
+			trapAction: `'exit 0'`,
+			grace:      5 * time.Second,
+			wantClosed: false,
+			reason:     "a well-behaved instruction's final output must not be truncated",
+		},
+		{
+			name:       "ignoring SIGTERM escalates to a kill and closes the pipes",
+			trapAction: `''`,
+			grace:      200 * time.Millisecond,
+			wantClosed: true,
+			reason:     "a descendant holding the write ends would block execute's eg.Wait() forever",
+		},
+	}
 
-	instruction := backgroundedWriterCommand("backgrounder", sentinel, started)
-	_, elapsed := cancelDuringInstruction(t, "checksum-cancel-pipes", instruction, started)
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			original := instructionTerminationGrace
+			instructionTerminationGrace = tc.grace
+			t.Cleanup(func() { instructionTerminationGrace = original })
 
-	// execute() calls eg.Wait() before cmd.Wait(), and eg.Wait() only returns once both pipes hit
-	// EOF. A surviving grandchild holds the write ends, so an implementation that only signals the
-	// direct child blocks here for the parent's full 60s sleep.
-	if elapsed > 30*time.Second {
-		t.Errorf("expected Apply to return well inside the instruction's 60s sleep, took %s", elapsed)
+			cancel, pipe, waited, stop := startWatchedCommand(t, tc.trapAction)
+
+			canceledAt := time.Now()
+			cancel()
+
+			// The command idles forever on its own, so this only returns because the watchdog
+			// terminated or killed it.
+			select {
+			case <-waited:
+			case <-time.After(30 * time.Second):
+				t.Fatal("the watchdog neither terminated nor killed the command")
+			}
+
+			// stop() waits for the watchdog goroutine to finish, and the pipe closes are the last
+			// thing it does, so no polling is needed: the count is final once stop() returns.
+			stop()
+
+			closes, closedAt := pipe.state()
+			if tc.wantClosed && closes == 0 {
+				t.Fatalf("expected the pipes to be closed when the watchdog escalated to a kill: %s", tc.reason)
+			}
+			if !tc.wantClosed && closes != 0 {
+				t.Fatalf("expected the pipes to be left open on the graceful path, got %d Close calls: %s", closes, tc.reason)
+			}
+			if !tc.wantClosed {
+				return
+			}
+			if elapsed := closedAt.Sub(canceledAt); elapsed < tc.grace {
+				t.Errorf("expected the pipes to be closed only after the %s grace elapsed, closed after %s", tc.grace, elapsed)
+			}
+		})
 	}
 }
 
