@@ -86,6 +86,10 @@ const PlanStatePaused planapi.PlanState = "paused"
 // secretConflictMergeKeys lists Secret data keys that updateSecret merges on conflict.
 // When retrying after an Update conflict, these keys are carried from the attempted write
 // into the freshly fetched secret before retrying the Update.
+//
+// Clearing one of these keys must be written as an empty value, never as a delete: the merge loop
+// only carries over keys present in the in-hand copy, so a deleted key leaves the freshly-fetched
+// Secret's stale value in place and the clear is silently lost on a conflict retry.
 var secretConflictMergeKeys = []string{
 	ProbeStatusesKey,
 	AppliedPeriodicOutputKey,

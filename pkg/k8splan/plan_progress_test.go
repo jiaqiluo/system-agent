@@ -115,7 +115,10 @@ func TestParsePlanProgress(t *testing.T) {
 
 // TestMarshalPlanProgressPinsJSONTagNames guards the wire format: an operator reads this record
 // with kubectl and a future Rancher may parse it, so a silent field rename would otherwise be
-// invisible.
+// invisible. The assertion is the exact encoding rather than a set of substrings, because
+// json.Marshal emits fields in declaration order: matching the whole string pins the tag names,
+// their order, and which field each tag is attached to. Substring checks would pass if two fields
+// exchanged tags, and the round trip is symmetric under that swap.
 func TestMarshalPlanProgressPinsJSONTagNames(t *testing.T) {
 	t.Parallel()
 
@@ -127,10 +130,9 @@ func TestMarshalPlanProgressPinsJSONTagNames(t *testing.T) {
 		Paused:      true,
 	}))
 
-	for _, want := range []string{`"checksum"`, `"completedInstructions"`, `"totalInstructions"`, `"resumeState"`, `"paused"`} {
-		if !strings.Contains(raw, want) {
-			t.Errorf("expected marshalled checkpoint to contain %s, got %s", want, raw)
-		}
+	want := `{"checksum":"checksum-a","completedInstructions":2,"totalInstructions":5,"resumeState":"in-progress","paused":true}`
+	if raw != want {
+		t.Errorf("marshalled checkpoint = %s, want %s", raw, want)
 	}
 }
 

@@ -31,8 +31,9 @@ type planProgress struct {
 func parsePlanProgress(data map[string][]byte, checksum string) planProgress {
 	raw, ok := data[PlanProgressKey]
 	if !ok || len(raw) == 0 {
-		// An empty value is how a terminal outcome clears the checkpoint, so it is absence, not
-		// corruption; decoding it would log a spurious error on every subsequent reconcile.
+		// An empty value is how the checkpoint is cleared, so it is absence, not corruption;
+		// decoding it would log a spurious error on every subsequent reconcile. Clearing it must
+		// be an empty value rather than a delete — see the comment on secretConflictMergeKeys.
 		return planProgress{}
 	}
 	var p planProgress
