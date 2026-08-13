@@ -60,7 +60,8 @@ survives a crash intact: an interrupted *execution* still re-runs from the begin
 | Pause granularity                     | Instruction boundary only; never interrupts a running instruction                                                                                                                                                      |
 | Probes during an interrupt            | Keep running. An interrupt suppresses *execution*, never *observation*                                                                                                                                                 |
 | Writing the interrupted outcome       | Fresh read-modify-write against the API server, never a merge from the stale in-hand copy                                                                                                                              |
-| Valid annotation values               | Exactly `"true"` and `"false"`; absent means `"false"`. Any other value is a configuration error: the plan neither runs nor is interrupted until an operator corrects it                                               |
+| Valid annotation values               | Plan-state flow: exactly `"true"` and `"false"`; absent means `"false"`. Any other value is a configuration error. Checksum flow: annotations are unsupported and ignored with a warning                                 |
+| Checksum-flow annotation behavior     | No effect on execution or state; no checkpoint writes; one warn-level log per reconcile when either annotation is present                                                                          |
 | Scope                                 | Remote mode (`pkg/k8splan`) only — annotations are a Secret concept; `pkg/localplan` is unaffected                                                                                                                     |
 
 ## Wire format additions
@@ -176,16 +177,20 @@ instructions of a single apply; see "Remaining risks" item 4 for where it stops 
 
 ### The suppression invariant
 
-> **The agent executes a plan only when both `plan.cattle.io/paused` and `plan.cattle.io/cancelled`
-> are unambiguously not set — absent, or present with the value `"false"`. Anything else stops
-> execution. Full stop — no matter what `plan-state` says, no matter what the checkpoint says, no
-> matter how the agent arrived at this reconcile.**
+> **In the plan-state flow, the agent executes a plan only when both `plan.cattle.io/paused` and
+> `plan.cattle.io/cancelled` are unambiguously not set — absent, or present with the value
+> `"false"`. Anything else stops execution. Full stop — no matter what `plan-state` says, no matter
+> what the checkpoint says, no matter how the agent arrived at this reconcile.**
 
-Note the shape of that statement: it is a whitelist of the two ways a plan is permitted to run, not
-a blacklist of the ways it is held. A value the agent does not recognise falls on the *stop* side by
-construction rather than by an explicit rule, which is what makes the invariant hold for values
-nobody anticipated. What such a value additionally does — see "Invalid annotation values" below —
-is report an error; what it does not do, ever, is let the plan proceed.
+In the checksum flow (`plan-state` absent, legacy orchestrators), these annotations are unsupported
+and intentionally have no effect: the agent logs a warning on **every reconcile** where either key
+is present and continues checksum reconciliation.
+
+In the plan-state flow, note the shape of that statement: it is a whitelist of the two ways a plan
+is permitted to run, not a blacklist of the ways it is held. A value the agent does not recognise
+falls on the *stop* side by construction rather than by an explicit rule, which is what makes the
+invariant hold for values nobody anticipated. What such a value additionally does — see "Invalid
+annotation values" below — is report an error; what it does not do, ever, is let the plan proceed.
 
 Every other rule in this document is subordinate to that one. It is stated separately because the
 dangerous failure mode is not "pause does not work" — an operator notices that immediately — but
@@ -193,12 +198,12 @@ dangerous failure mode is not "pause does not work" — an operator notices that
 minutes or hours after the operator walked away, and is exactly the situation pause exists to
 prevent.
 
-The invariant is upheld structurally rather than by remembering to check for it: `readInterrupt` is
-evaluated at the top of the reconcile, and both the interrupt branch and the invalid-value branch
-**return**. Everything capable of starting work — `resolveResume`, the resume commit,
-`decidePlanStateAction`, the `pending → in-progress` pre-commit, `Apply` — sits below those returns
-and therefore runs only when `readInterrupt` reported no error and `InterruptionNone`. There is no
-ordering in which a suspended plan reaches them.
+The invariant is upheld structurally rather than by remembering to check for it: in the plan-state
+flow, `readInterrupt` is evaluated at the top of the reconcile, and both the interrupt branch and
+the invalid-value branch **return**. Everything capable of starting work — `resolveResume`, the
+resume commit, `decidePlanStateAction`, the `pending → in-progress` pre-commit, `Apply` — sits
+below those returns and therefore runs only when `readInterrupt` reported no error and
+`InterruptionNone`. There is no ordering in which a suspended plan reaches them.
 
 Three consequences worth naming, because each is a plausible bug that this ordering rules out:
 
@@ -218,11 +223,12 @@ setting it to `"false"` — and the reconcile that observes the change is the on
 execute. The two forms are indistinguishable to the agent and are treated identically everywhere in
 this document; "removing the annotation" is shorthand for both.
 
-### Invalid annotation values
+### Invalid annotation values (plan-state flow only)
 
 The only valid values are `"true"` and `"false"`. An absent annotation is `"false"`. Everything else
 — `"True"`, `"1"`, `"yes"`, `""`, a stray trailing space — is a **configuration error**, not a
-request, and the operator has to correct it.
+request, and the operator has to correct it. This section applies only when `plan-state` is present;
+checksum flow logs and ignores annotation values.
 
 The agent's response to one is deliberately narrow. It:
 
@@ -314,22 +320,13 @@ On top of that:
   annotation is removed, a canceled plan behaves exactly like a failed one: probes run, nothing
   executes, and the orchestrator must deliver new content with `pending` to move forward. No `Halt`
   flag and no change to terminal-state handling are required.
-- **Checksum flow** (`plan-state` absent, legacy orchestrators): both annotations still suppress
-  apply, but no `plan-state`/`plan-progress` is written — doing so would silently switch the Secret
-  into the plan-state flow. Probes still run. Unpausing falls back to normal checksum
-  reconciliation.
+- **Checksum flow** (`plan-state` absent, legacy orchestrators): annotations are unsupported and
+  have **no effect**. The agent logs a warning on **every reconcile** when either annotation is
+  present and proceeds with ordinary checksum reconciliation. It does not write `plan-state` or
+  `plan-progress`, and it never starts interrupt watches/channels for this flow.
 
-  This rule binds **both** interrupt paths, not just the reconcile-entry one. An interrupt that
-  arrives mid-apply is the easier case to get wrong: the natural implementation of the interrupted
-  outcome writes the state and the checkpoint unconditionally, which on a legacy orchestrator
-  materialises `plan-state` for the first time and silently promotes that Secret into plan-state
-  semantics for the rest of its life. Every `plan-state`/`plan-progress` write on either path is
-  gated on `UsesPlanState`. Concretely, in the checksum flow an interrupted apply writes only
-  `applied-output` and `probe-statuses`, leaves `applied-checksum` stale, and therefore re-runs the
-  whole plan from instruction 0 once the annotation clears — which is the correct legacy semantic,
-  since there is nowhere to record a checkpoint. `resumeFrom` is likewise always 0 there: it can
-  only be non-zero via `resolveResume`, which requires a checkpoint that the checksum flow never
-  writes.
+  Recommended warning shape (one line per present key, every reconcile):
+  `warn: ignoring unsupported annotation in checksum flow key=<annotation> value=<value>`
 - **The agent never edits the annotations**; the orchestrator owns them. A new plan delivered with
   the cancel annotation still set is canceled again — logged at warn level.
 
@@ -567,9 +564,9 @@ period the plan is actually held.
 If something does go wrong, two fallbacks remain and neither needs new configuration, because both
 are shipping decisions rather than runtime ones:
 
-| Failure discovered | Response | What still works |
-| --- | --- | --- |
-| Planner mishandles `cancelled` | Do not ship cancel; pause is independent of it | Pause, checkpoint, resume |
+| Failure discovered              | Response                                                                     | What still works                                                                    |
+|---------------------------------|------------------------------------------------------------------------------|-------------------------------------------------------------------------------------|
+| Planner mishandles `cancelled`  | Do not ship cancel; pause is independent of it                               | Pause, checkpoint, resume                                                           |
 | Checkpointing itself is unsound | Ship cancel only, or set `ResumeFromOneTimeInstruction` to 0 unconditionally | Pause degrades to "suppress and re-run from the start" — the checksum-flow semantic |
 
 Neither requires reverting the applyinator work: the interruption points, the process-tree kill and
@@ -760,8 +757,15 @@ outcome `Update` is guaranteed to 409. Consequences under the original design:
 
 1. Existing preamble, unchanged, through `CalculatePlan`, `parseProbeStatuses`, `currentPlanState`
    and `parseFailureCount`.
-2. `interrupt, err := readInterrupt(secret.Annotations)` — **unconditionally, before any state is
-   resolved and before any decision to execute is taken**.
+2. Branch by flow first:
+
+   - If `currentPlanState == ""` (checksum flow), annotations are unsupported. When either
+     annotation key is present, log `warn` on every reconcile (include key/value) and continue as
+     ordinary checksum reconcile. No interrupt decision, no lifecycle-key writes, no checkpoint
+     logic.
+   - Otherwise (plan-state flow), evaluate
+     `interrupt, err := readInterrupt(secret.Annotations)` **before any decision to execute is
+     taken**.
 
    If `err != nil`: `logrus.Errorf` the message and `return secret, err`. No Secret write, no
    probes, no `Apply`, no `EnqueueAfter` — the workqueue's own rate limiter owns the retry. This is
@@ -770,22 +774,26 @@ outcome `Update` is guaranteed to 409. Consequences under the original design:
 
    Otherwise, if `interrupt != InterruptionNone`:
    - `handleInterrupt` computes the state updates (possibly none),
-   - lifecycle-key writes (`plan-state`, `plan-progress`) are gated on `UsesPlanState`; in checksum flow this path writes probe status (and any non-lifecycle output keys) only,
+   - lifecycle-key writes (`plan-state`, `plan-progress`) are applied,
    - `prober.DoProbes(cp.Plan.Probes, probeStatuses, false)` runs and the marshaled statuses join
      the same update map,
    - one `writeInterruptOutcome` call persists both,
    - `sc.EnqueueAfter(..., interruptedEnqueuePeriod)`; **return**.
 
-   Those two returns are the enforcement point for the suppression invariant, and they are why
-   steps 3-8 need no interrupt handling of their own: they are unreachable unless both annotations
-   read as an explicit false. Worth a comment in the code saying so, because the branches look like
-   early-exit optimisations and are in fact a safety property.
-3. Everything below here runs only when `err == nil && interrupt == InterruptionNone`.
+   Those two returns are the enforcement point for the suppression invariant in the plan-state
+   flow, and they are why steps 3-8 need no interrupt handling of their own there: they are
+   unreachable unless both annotations read as an explicit false. Worth a comment in the code
+   saying so, because the branches look like early-exit optimisations and are in fact a safety
+   property.
+3. Everything below here runs only when either:
+   - checksum flow is active (`currentPlanState == ""`), or
+   - plan-state flow has `err == nil && interrupt == InterruptionNone`.
    `effectiveState, resumeFrom := resolveResume(currentPlanState, secret.Data, cp.Checksum)`.
    Every downstream use of `currentPlanState` becomes `effectiveState`, including `UsesPlanState`
    in `applyOutcomeInput`.
-4. If the plan *was* suspended and no longer is — `currentPlanState == paused`, or the checkpoint
-   carried `Paused: true` — issue the resume commit described above: `plan-state` =
+4. **Plan-state flow only** (`currentPlanState != ""`): if the plan *was* suspended and no longer is
+   — `currentPlanState == paused`, or the checkpoint carried `Paused: true` — issue the resume
+   commit described above: `plan-state` =
    `effectiveState`, checkpoint `Paused: false`. Reaching this step is itself the proof that the
    annotation is gone, so "was suspended" is the only condition that has to be tested here. Where
    `effectiveState` is `pending` this folds into the pre-commit in the next step; where it is
@@ -798,10 +806,8 @@ outcome `Update` is guaranteed to 409. Consequences under the original design:
 7. If `applyOutput.Interruption != InterruptionNone`, take the interrupted outcome path instead of
    `buildSecretDataUpdates` (which would otherwise write `plan-state: failed`, since an interrupted
    apply has `OneTimeApplySucceeded == false`):
-   - **only when `UsesPlanState`**, `plan-state` = `cancelled`/`paused` and the `plan-progress`
-     checkpoint, per the ResumeState table. This guard is not optional: writing either key in the
-     checksum flow promotes the Secret into plan-state semantics permanently, which the entry path
-     is already careful to avoid,
+   - `plan-state` = `cancelled`/`paused` and the `plan-progress` checkpoint, per the ResumeState
+     table (this path is plan-state flow only),
    - `applied-output` with the accumulated one-time output — this is what `selectExistingOutput`
      feeds back as `ExistingOneTimeOutput`, so `SaveOutput` results from already-completed
      instructions survive the pause,
@@ -812,8 +818,7 @@ outcome `Update` is guaranteed to 409. Consequences under the original design:
    - on cancel with `0 < completed < total`, `logrus.Warnf` that the plan was canceled after
      partial execution and the node may be in an inconsistent state.
 
-   In the checksum flow this reduces to `applied-output` plus `probe-statuses`, which is the whole
-   of what a legacy Secret can express about an interrupted apply.
+   In checksum flow this branch is not entered, because annotations are ignored there.
 8. Otherwise the existing `buildSecretDataUpdates` path, unchanged.
 
 `interruptedEnqueuePeriod` (1 minute) replaces `probePeriod` for the interrupt path's re-enqueue.
@@ -949,8 +954,8 @@ been removed and `plan-state` is still `cancelled`, call `UpdatePlan` to rewrite
 the annotation is what re-arms the node:
 
 ```go
-if entry.Plan.PlanState == planapi.PlanStateCancelled &&
-    entry.Metadata.Annotations[planapi.PlanCancelledAnnotation] != "true" {
+v, ok := entry.Metadata.Annotations[planapi.PlanCancelledAnnotation]
+if entry.Plan.PlanState == planapi.PlanStateCancelled && (!ok || v == "false") {
     // operator cleared the cancellation; re-drive the existing plan
 }
 ```
@@ -1124,26 +1129,31 @@ every row that **`Apply` is never called** and no instruction sentinel file appe
 | `in-progress`          | `Paused: true`, `Completed: 2`  | the write-once guard keys off the checkpoint, not `plan-state` |
 | `pending`              | absent                          | a plan delivered already paused                                |
 | `succeeded`            | absent                          | terminal; nothing to suppress, asserts no regression           |
-| absent (checksum flow) | absent                          | suppression must not depend on `plan-state` existing           |
+| absent (checksum flow) | absent                          | baseline legacy behavior with no annotation influence          |
 | `cancelled`            | `Paused: false`, `Completed: 2` | a cancel report is not a suspension                            |
 
-Every row carries `plan.cattle.io/paused: "true"`, and the rows are chosen so that at least one
-would execute if the annotation check were moved below `resolveResume`, below
-`decidePlanStateAction`, or below the checksum comparison — `in-progress` re-executes on restart,
-`pending` starts, and the checksum-flow row applies on mismatch.
+All plan-state-flow rows carry `plan.cattle.io/paused: "true"`. The checksum-flow row is run as a
+separate baseline fixture (annotation absent), because checksum flow ignores annotations by design.
+The plan-state-flow rows are chosen so that at least one would execute if the annotation check were
+moved below `resolveResume` or below `decidePlanStateAction` — `in-progress` re-executes on restart
+and `pending` starts.
 
 The rows whose suspension is already recorded additionally assert **zero `Update` calls** — the
 write-once guard honoring a checkpoint the current process did not write — and the row with no
 checkpoint asserts exactly one, recording the suspension for the first time.
 
-The same matrix runs a second time with the value replaced by an invalid one (`"True"`, `"yes"`,
-`""`), asserting the stricter outcome: `Apply` never called, **and zero `Update` calls on every
-row** including the ones that would otherwise record a suspension, **and** a non-nil error from
-`reconcileSecret`. That last assertion is the one that distinguishes this revision from a
-fail-closed read — a typo must not be able to masquerade as a working pause, so it is not enough
-that the plan is held; the reconcile has to say something is wrong. A third pass asserts the
-`resourceVersion` is byte-identical before and after, which is how "writes nothing" is checked
-rather than inferred from the `Update` count.
+The same matrix runs a second time (plan-state flow only) with the value replaced by an invalid one
+(`"True"`, `"yes"`, `""`), asserting the stricter outcome: `Apply` never called, **and zero
+`Update` calls on every row** including the ones that would otherwise record a suspension, **and** a
+non-nil error from `reconcileSecret`. That last assertion is the one that distinguishes this
+revision from a fail-closed read — a typo must not be able to masquerade as a working pause, so it
+is not enough that the plan is held; the reconcile has to say something is wrong. A third pass
+asserts the `resourceVersion` is byte-identical before and after, which is how "writes nothing" is
+checked rather than inferred from the `Update` count.
+
+Checksum flow gets its own invalid-value case: annotation present with `"True"`/`"yes"`/`""`
+produces a warn log on every reconcile, no interrupt behavior, and ordinary checksum apply
+semantics.
 
 Then the resume half:
 
@@ -1175,15 +1185,16 @@ Plus one for the exit path itself:
 
 Four cases exist specifically for the defects this revision fixes, and should be written first:
 
-- **Checksum-flow interrupt writes no lifecycle keys — entry path.** No `plan-state` on the input
-  Secret, pause annotation set. Assert the resulting Secret data contains neither `plan-state` nor
-  `plan-progress`, and that `probe-statuses` is still written.
-- **Checksum-flow interrupt writes no lifecycle keys — mid-apply path.** Same Secret, but the
-  interrupt is delivered while `Apply` is in flight so the outcome runs through step 7 rather than
-  the entry path. Assert the same two keys are absent, that `applied-checksum` is unchanged, and
-  that the following reconcile re-runs from instruction 0. This is the case the `UsesPlanState`
-  guard exists for; without a test it regresses invisibly, because the plan-state flow keeps
-  passing.
+- **Checksum-flow annotation is ignored — entry path.** No `plan-state` on the input Secret,
+  annotation set (`paused` or `cancelled`). Assert a warn log is emitted on every reconcile and
+  reconcile follows
+  ordinary checksum behavior (including normal apply decision based on checksum), with no
+  `plan-state`/`plan-progress` writes. Assert warning text includes checksum-flow context plus
+  key/value.
+- **Checksum-flow annotation is ignored while apply is running.** Same Secret, annotation appears
+  while `Apply` is in flight. Assert no interrupt channels close, no interrupted-outcome path runs,
+  and the apply completes under normal checksum semantics. A subsequent reconcile logs warn again if
+  the annotation remains.
 
 - **Conflicting write during an interrupted apply.** The fake client returns `Conflict` on the
   first `Update` and a Secret bearing the operator's annotation on the subsequent `Get`. Assert
@@ -1228,10 +1239,11 @@ behaviour.
 ### Docs
 
 Add a "Cancellation and pause" paragraph to the `pkg/k8splan` section of `CLAUDE.md`, leading with
-the suppression invariant — a plan runs only when both annotations are absent or `"false"`, and
-clearing the annotation is the only thing that resumes it — then the accepted values (`"true"` and
-`"false"`, everything else an error), the execution-vs-observation rule and the pause-is-a-boundary
-semantics. It also needs to qualify the
+the suppression invariant in the plan-state flow — a plan runs only when both annotations are absent
+or `"false"`, and clearing the annotation is the only thing that resumes it — plus the checksum-flow
+rule (annotations are ignored with a warning). Then cover the accepted values (`"true"` and
+`"false"`, everything else an error in plan-state flow), the execution-vs-observation rule and the
+pause-is-a-boundary semantics. It also needs to qualify the
 crash-recovery sentence already there — "`in-progress` on startup → re-apply" — with the pause
 exception: a plan held by the pause annotation is not re-applied on startup, and a suspended
 checkpoint is honored across agent lifetimes so the eventual unpause resumes rather than restarts.
