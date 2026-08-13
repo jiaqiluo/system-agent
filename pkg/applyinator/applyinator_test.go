@@ -1223,20 +1223,24 @@ func assertPathAbsent(t *testing.T, path, reason string) {
 	}
 }
 
-// touchInstruction returns a one-time instruction that creates sentinel and returns immediately.
-func touchInstruction(name, sentinel string) planapi.OneTimeInstruction {
-	return planapi.OneTimeInstruction{
-		CommonInstruction: planapi.CommonInstruction{Name: name, Command: "sh", Args: []string{"-c", "touch " + sentinel}},
-	}
+// touchCommand returns a command that creates sentinel and returns immediately.
+func touchCommand(name, sentinel string) planapi.CommonInstruction {
+	return planapi.CommonInstruction{Name: name, Command: "sh", Args: []string{"-c", "touch " + sentinel}}
 }
 
-// gatedTouchInstruction returns a one-time instruction that creates sentinel and then blocks until
-// gate exists, giving a test a deterministic window during which the instruction is still running.
-func gatedTouchInstruction(name, sentinel, gate string) planapi.OneTimeInstruction {
+// gatedTouchCommand returns a command that creates sentinel and then blocks until gate exists,
+// giving a test a deterministic window during which the instruction is still running.
+func gatedTouchCommand(name, sentinel, gate string) planapi.CommonInstruction {
 	script := "touch " + sentinel + "; while [ ! -e " + gate + " ]; do sleep 0.02; done"
-	return planapi.OneTimeInstruction{
-		CommonInstruction: planapi.CommonInstruction{Name: name, Command: "sh", Args: []string{"-c", script}},
-	}
+	return planapi.CommonInstruction{Name: name, Command: "sh", Args: []string{"-c", script}}
+}
+
+func touchInstruction(name, sentinel string) planapi.OneTimeInstruction {
+	return planapi.OneTimeInstruction{CommonInstruction: touchCommand(name, sentinel)}
+}
+
+func gatedTouchInstruction(name, sentinel, gate string) planapi.OneTimeInstruction {
+	return planapi.OneTimeInstruction{CommonInstruction: gatedTouchCommand(name, sentinel, gate)}
 }
 
 type applyResult struct {
@@ -1312,6 +1316,7 @@ func TestApplyPauseStopsBeforeTheNextInstruction(t *testing.T) {
 	dir := t.TempDir()
 	firstSentinel := filepath.Join(dir, "first-ran")
 	secondSentinel := filepath.Join(dir, "second-ran")
+	periodicSentinel := filepath.Join(dir, "periodic-ran")
 	gate := filepath.Join(dir, "gate")
 
 	a := newTestApplyinator(t, "", false, "", "")
@@ -1319,6 +1324,11 @@ func TestApplyPauseStopsBeforeTheNextInstruction(t *testing.T) {
 		OneTimeInstructions: []planapi.OneTimeInstruction{
 			gatedTouchInstruction("first", firstSentinel, gate),
 			touchInstruction("second", secondSentinel),
+		},
+		// Present so this test also pins the rule that an interrupted one-time set suppresses the
+		// periodic instructions: running them would execute work the operator asked to stop.
+		PeriodicInstructions: []planapi.PeriodicInstruction{
+			{CommonInstruction: touchCommand("periodic", periodicSentinel)},
 		},
 	}
 
@@ -1349,6 +1359,18 @@ func TestApplyPauseStopsBeforeTheNextInstruction(t *testing.T) {
 		t.Error("expected a pause with no failure to still report OneTimeApplySucceeded=true")
 	}
 	assertPathAbsent(t, secondSentinel, "a pause stops before the next instruction")
+	assertPathAbsent(t, periodicSentinel, "an interrupted one-time set skips the periodic instructions entirely")
+	// The sentinel above cannot distinguish "Apply returned before calling runPeriodicInstructions"
+	// from "runPeriodicInstructions ran and broke at its own boundary check", because the pause is
+	// still pending either way. These two assertions can: a periodic pass that runs -- even a
+	// no-op one -- replaces PeriodicOutput with an encoded empty map and sets PeriodicApplySucceeded.
+	// An abandoned one-time set must leave the caller's recorded periodic state untouched instead.
+	if output.PeriodicOutput != nil {
+		t.Errorf("expected PeriodicOutput to be left as the caller passed it (nil), got %d bytes", len(output.PeriodicOutput))
+	}
+	if output.PeriodicApplySucceeded {
+		t.Error("expected PeriodicApplySucceeded=false: no periodic pass may run once the one-time set is interrupted")
+	}
 }
 
 func TestApplyResumeFromSkipsAlreadyCompletedInstructions(t *testing.T) {
@@ -1497,6 +1519,13 @@ func TestApplyCancelDuringLongRunningInstructionReturnsPromptly(t *testing.T) {
 	if output.CompletedOneTimeInstructions != 0 {
 		t.Errorf("expected the killed instruction to not advance the checkpoint, got %d", output.CompletedOneTimeInstructions)
 	}
+	// A killed instruction is still a failed instruction, so OneTimeApplySucceeded is false here.
+	// "A cancel-induced kill must not be reported as a plan failure" is therefore an obligation on
+	// the caller: it has to test Interruption BEFORE OneTimeApplySucceeded, or it will record a
+	// cancelled plan as failed. Pinned so the downstream reconcile task can rely on this ordering.
+	if output.OneTimeApplySucceeded {
+		t.Error("expected OneTimeApplySucceeded=false for a cancel-killed instruction; callers must check Interruption first")
+	}
 }
 
 func TestApplyFailureIsNotReportedAsAnInterruption(t *testing.T) {
@@ -1587,4 +1616,114 @@ func TestRunOneTimeInstructionsOutOfRangeResumeIndex(t *testing.T) {
 			waitForPath(t, second, time.Second)
 		})
 	}
+}
+
+func TestRunPeriodicInstructionsStopsWhenInterrupted(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires a POSIX shell")
+	}
+	t.Parallel()
+
+	testCases := []struct {
+		name   string
+		cancel signalState
+		pause  signalState
+	}{
+		{name: "a pending pause stops before the next instruction", cancel: signalNil, pause: signalClosed},
+		{name: "a pending cancel stops before the next instruction", cancel: signalClosed, pause: signalNil},
+		{name: "open channels do not stop anything", cancel: signalOpen, pause: signalOpen},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			dir := t.TempDir()
+			first, second := filepath.Join(dir, "first-ran"), filepath.Join(dir, "second-ran")
+			a := NewApplyinator(t.TempDir(), false, "", "", nil)
+			cp := CalculatedPlan{
+				Checksum: "checksum-periodic-interrupted",
+				Plan: planapi.Plan{
+					PeriodicInstructions: []planapi.PeriodicInstruction{
+						{CommonInstruction: touchCommand("first", first)},
+						{CommonInstruction: touchCommand("second", second)},
+					},
+				},
+			}
+
+			output, succeeded, err := a.runPeriodicInstructions(context.Background(), t.TempDir(), cp, nil, false, time.Now(),
+				newSignal(tc.cancel), newSignal(tc.pause))
+			if err != nil {
+				t.Fatalf("runPeriodicInstructions returned error: %v", err)
+			}
+			if !succeeded {
+				t.Error("expected succeeded=true: an interruption is not a failure, and nothing that ran failed")
+			}
+
+			outputs := decodePeriodicOutputs(t, output)
+			interrupted := tc.cancel == signalClosed || tc.pause == signalClosed
+			if !interrupted {
+				waitForPath(t, first, time.Second)
+				waitForPath(t, second, time.Second)
+				if len(outputs) != 2 {
+					t.Errorf("expected both instructions to be recorded, got %v", outputs)
+				}
+				return
+			}
+			assertPathAbsent(t, first, "an interruption pending at entry stops before the first periodic instruction")
+			assertPathAbsent(t, second, "an interruption pending at entry stops before the first periodic instruction")
+			if len(outputs) != 0 {
+				t.Errorf("expected no periodic instruction to be recorded, got %v", outputs)
+			}
+		})
+	}
+}
+
+func TestApplyPauseDuringPeriodicInstructionsIsReported(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires a POSIX shell")
+	}
+	t.Parallel()
+
+	dir := t.TempDir()
+	firstSentinel := filepath.Join(dir, "first-ran")
+	secondSentinel := filepath.Join(dir, "second-ran")
+	gate := filepath.Join(dir, "gate")
+
+	a := newTestApplyinator(t, "", false, "", "")
+	// RunOneTimeInstructions is false, so the interruption below can only reach ApplyOutput through
+	// Apply's re-check after runPeriodicInstructions returns: periodic instructions have no
+	// checkpoint and their runner does not report an interruption itself.
+	plan := planapi.Plan{
+		PeriodicInstructions: []planapi.PeriodicInstruction{
+			{CommonInstruction: gatedTouchCommand("first", firstSentinel, gate)},
+			{CommonInstruction: touchCommand("second", secondSentinel)},
+		},
+	}
+
+	pause := make(chan struct{})
+	results := applyAsync(a, ApplyInput{
+		CalculatedPlan:               CalculatedPlan{Plan: plan, Checksum: "checksum-periodic-pause"},
+		RunOneTimeInstructions:       false,
+		Pause:                        pause,
+		ResumeFromOneTimeInstruction: 2,
+	})
+
+	waitForPath(t, firstSentinel, 30*time.Second)
+	close(pause)
+	if err := os.WriteFile(gate, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	output := awaitApply(t, results, 30*time.Second)
+	if output.Interruption != InterruptionPaused {
+		t.Errorf("expected %q, got %q", InterruptionPaused, output.Interruption)
+	}
+	if !output.PeriodicApplySucceeded {
+		t.Error("expected a pause with no failure to still report PeriodicApplySucceeded=true")
+	}
+	if output.CompletedOneTimeInstructions != 2 {
+		t.Errorf("expected the one-time checkpoint to be reported unchanged (2), got %d", output.CompletedOneTimeInstructions)
+	}
+	assertPathAbsent(t, secondSentinel, "a pause stops before the next periodic instruction")
 }
