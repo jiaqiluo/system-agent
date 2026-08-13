@@ -60,9 +60,28 @@ const (
 	// PlanKey is the Secret data key for the plan payload.
 	PlanKey = "plan"
 
+	// TODO: upstream these into github.com/rancher/rancher/pkg/plan alongside PlanStateCancelled,
+	// then drop the local definitions and bump the dependency.
+
+	// PlanCancelledAnnotation, set to "true" on the plan Secret, requests that the agent abort the
+	// plan. Removing it does not un-cancel: the plan is terminal and waits for new content.
+	// The only valid values are "true" and "false"; see readInterrupt.
+	PlanCancelledAnnotation = "plan.cattle.io/cancelled"
+	// PlanPausedAnnotation, set to "true" on the plan Secret, requests that the agent hold
+	// execution. While it is set the agent executes nothing for this plan, whatever plan-state or
+	// the resume checkpoint say; clearing it is the only thing that resumes the plan.
+	// The only valid values are "true" and "false"; see readInterrupt.
+	PlanPausedAnnotation = "plan.cattle.io/paused"
+	// PlanProgressKey is the Secret data key holding the resume checkpoint (JSON, see planProgress).
+	PlanProgressKey = "plan-progress"
+
 	enqueueAfterDuration  = "5s"
 	cooldownTimerDuration = "30s"
 )
+
+// PlanStatePaused is a non-terminal plan-state: execution is held at an instruction boundary and
+// will resume into planProgress.ResumeState when the pause annotation is removed.
+const PlanStatePaused planapi.PlanState = "paused"
 
 // secretConflictMergeKeys lists Secret data keys that updateSecret merges on conflict.
 // When retrying after an Update conflict, these keys are carried from the attempted write
@@ -79,6 +98,7 @@ var secretConflictMergeKeys = []string{
 	AppliedOutputKey,
 	planapi.PlanStateKey,
 	planapi.PlanRevisionKey,
+	PlanProgressKey,
 }
 
 func Watch(ctx context.Context, applyinator applyinator.Applyinator, connInfo config.ConnectionInfo, strictVerify bool) {
@@ -193,8 +213,17 @@ func (w *watcher) updateSecret(sc corecontrollers.SecretController, secret *core
 						if ck.Checksum == string(secret.Data[AppliedChecksumKey]) {
 							logrus.Debugf("[k8splan] secret %s/%s resource version changed from %s to %s but plan checksum still matches, updating latest secret", secret.Namespace, secret.Name, secret.ResourceVersion, latestSecret.ResourceVersion)
 							// we can go ahead copy the relevant data out of the "old" secret and return true to let it update the secret.
+							// Defensive: the PlanKey lookup above means Data is non-nil today, but writing into a
+							// nil map panics, so do not depend on that.
+							if latestSecret.Data == nil {
+								latestSecret.Data = map[string][]byte{}
+							}
 							for _, key := range secretConflictMergeKeys {
-								latestSecret.Data[key] = secret.Data[key]
+								// Only carry over keys the in-hand copy actually has: a key the agent never
+								// wrote must not be materialised as an empty value on the fresh object.
+								if v, ok := secret.Data[key]; ok {
+									latestSecret.Data[key] = v
+								}
 							}
 							secret = latestSecret
 							latestSecretUpdateAttempted = true
