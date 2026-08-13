@@ -6,9 +6,7 @@ import (
 	"errors"
 	"os"
 	"os/exec"
-	"runtime"
 	"sync"
-	"unsafe"
 
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/windows"
@@ -34,31 +32,20 @@ var processJobs sync.Map
 // terminated in one call. It must be called before cmd.Start(), because Windows requires the job to
 // exist before there is a process to assign to it; assignProcessTree does the assignment afterwards.
 //
+// The job exists for exactly one purpose: to give killProcessTree a handle through which
+// TerminateJobObject can reach the whole tree. It deliberately does NOT set
+// JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE. That flag fires when the last handle closes, and
+// releaseProcessTree closes this one at the end of *every* execute, successful ones included -- so
+// setting it would silently stop a Windows instruction from leaving a background process behind,
+// while a Unix one still can. Orphan reaping on the success path is not what this change is for,
+// and the asymmetry would be a Windows-only behaviour change no test in this repo can exercise.
+//
 // Signalling the direct child alone is not enough. Plan instructions are near-universally a script
 // that shells out to an installer or a package manager, and killing the script leaves the real work
 // running.
 func configureProcessGroup(cmd *exec.Cmd) error {
 	job, err := windows.CreateJobObject(nil, nil)
 	if err != nil {
-		return err
-	}
-
-	// KILL_ON_JOB_CLOSE means nothing outlives the job: when releaseProcessTree closes the last
-	// handle to it, any process still inside is terminated. Note that this also applies on the
-	// success path, so a Windows instruction cannot leave a detached background process behind.
-	info := &windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION{}
-	info.BasicLimitInformation.LimitFlags |= windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-	_, err = windows.SetInformationJobObject(
-		job,
-		windows.JobObjectExtendedLimitInformation,
-		uintptr(unsafe.Pointer(info)),
-		uint32(unsafe.Sizeof(*info)),
-	)
-	// info reaches the kernel only as a uintptr, which the garbage collector does not treat as a
-	// live reference, so it has to be kept alive explicitly across the call.
-	runtime.KeepAlive(info)
-	if err != nil {
-		_ = windows.CloseHandle(job)
 		return err
 	}
 
