@@ -1535,6 +1535,138 @@ func TestReconcileSecretCancelDuringApplyIsNotRecordedAsAFailure(t *testing.T) {
 	}
 }
 
+// TestReconcileSecretInterruptDuringAPeriodicApplyOfATerminalPlan pins that the mid-apply
+// interrupt path applies cancel's terminal write-once guard exactly where the reconcile-entry path
+// applies it, and — the other half, which is what makes the guard's cancel-only-ness load-bearing
+// — that pause is NOT subject to it.
+//
+// The window is real, not theoretical. A succeeded plan is reconciled forever: it still runs its
+// periodic instructions on every pass, so an apply is in flight for part of every cycle even
+// though needsApplied is false. Without the guard the same `kubectl annotate cancelled=true` on
+// the same node yields "succeeded" (untouched) when it lands at reconcile entry and "cancelled"
+// when it lands during that periodic apply — a coin flip decided by which side of a 2s poll the
+// operator's write falls on. Cancel is terminal, so the losing side of that flip is permanent.
+//
+// The pause row additionally pins that applied-output is not materialised when there is no
+// one-time output to write: on the periodic-only path it is selectExistingOutput's empty slice,
+// and inventing an empty applied-output on a Secret that never had one writes a key the agent
+// does not own.
+//
+// Not parallel: it shortens the package-level interruptPollInterval.
+func TestReconcileSecretInterruptDuringAPeriodicApplyOfATerminalPlan(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires a POSIX shell")
+	}
+	withInterruptPollInterval(t, 2*time.Millisecond)
+
+	tests := []struct {
+		name       string
+		annotation string
+		// wantRecorded is whether the interrupt should reach the Secret at all.
+		wantRecorded bool
+	}{
+		{
+			name:       "cancelling writes nothing: plan-state is already terminal",
+			annotation: PlanCancelledAnnotation,
+		},
+		{
+			name:         "pausing still records, because the resume reads the checkpoint back",
+			annotation:   PlanPausedAnnotation,
+			wantRecorded: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			started := filepath.Join(dir, "periodic-started")
+			gate := filepath.Join(dir, "gate")
+			mustNotRun := filepath.Join(dir, "second-periodic-ran")
+
+			// Two periodic instructions: the first blocks until the gate opens, so the interrupt
+			// lands while the apply is genuinely in flight; the second must never run, whichever
+			// interrupt it was. A cancel kills the first where it stands, so its gate is never
+			// opened.
+			planBytes, checksum := marshalPlan(t, planapi.Plan{
+				PeriodicInstructions: []planapi.PeriodicInstruction{
+					{CommonInstruction: planapi.CommonInstruction{
+						Name: "blocker", Command: "sh",
+						Args: []string{"-c", "touch " + started + "; while [ ! -f " + gate + " ]; do sleep 0.02; done"},
+					}},
+					{CommonInstruction: planapi.CommonInstruction{
+						Name: "second", Command: "sh", Args: []string{"-c", "touch " + mustNotRun},
+					}},
+				},
+			})
+
+			// A converged node: the plan succeeded, and this reconcile exists only to run the
+			// periodic instructions and the probes. probe-statuses is pre-seeded at its steady
+			// state so that "no lifecycle write" can be asserted as "no Update at all" — probes
+			// deliberately keep running on the interrupt paths, and an absent key would make the
+			// marshalled empty map a genuine change.
+			secret := newInterruptTestSecret(planBytes, nil, map[string][]byte{
+				planapi.PlanStateKey: []byte(planapi.PlanStateSucceeded),
+				AppliedChecksumKey:   []byte(checksum),
+				ProbeStatusesKey:     []byte("{}"),
+			})
+			rec := newInterruptRecorder(secret)
+			sc := newInterruptTestController(t, rec)
+			serveInterruptOnceApplyStarted(t, sc, tt.annotation, started, func(served int) {
+				// Pause is a boundary, so the blocker has to be let go before the periodic loop
+				// can reach its next-instruction check. Released on the poll AFTER the one that
+				// served the annotation, by which point pollInterrupts has certainly closed the
+				// pause channel: both polls run on the same goroutine.
+				if tt.wantRecorded && served > 1 {
+					if writeErr := os.WriteFile(gate, nil, 0600); writeErr != nil {
+						t.Errorf("failed to release the gate: %v", writeErr)
+					}
+				}
+			})
+
+			w := newTestWatcher(t, true, "42")
+			result, err := w.reconcileSecret(context.Background(), sc, secret, 30*time.Second)
+			if err != nil {
+				t.Fatalf("reconcileSecret returned error: %v", err)
+			}
+
+			assertPathAbsent(t, mustNotRun, "an interrupt must stop the periodic loop before the next instruction")
+			if periods := rec.enqueuePeriods(); len(periods) != 1 || periods[0] != interruptedEnqueuePeriod {
+				t.Errorf("expected a single re-enqueue after %v, got %v", interruptedEnqueuePeriod, periods)
+			}
+
+			writes := rec.writes()
+			if !tt.wantRecorded {
+				if len(writes) != 0 {
+					t.Errorf("expected no Secret write at all, got %d: %v", len(writes), writes[0].Data)
+				}
+				if got := planapi.PlanState(result.Data[planapi.PlanStateKey]); got != planapi.PlanStateSucceeded {
+					t.Errorf("expected plan-state to stay %q, got %q; a converged node must not be downgraded by a cancel it would have ignored a moment earlier",
+						planapi.PlanStateSucceeded, got)
+				}
+				if _, ok := result.Data[PlanProgressKey]; ok {
+					t.Errorf("expected no checkpoint on a terminal plan, got %q", result.Data[PlanProgressKey])
+				}
+				return
+			}
+
+			if len(writes) != 1 {
+				t.Fatalf("expected exactly one Secret write, got %d", len(writes))
+			}
+			if got := planapi.PlanState(writes[0].Data[planapi.PlanStateKey]); got != PlanStatePaused {
+				t.Errorf("wrote plan-state %q, want %q; a pause on a terminal plan must still be recorded", got, PlanStatePaused)
+			}
+			want := planProgress{Checksum: checksum, ResumeState: planapi.PlanStateSucceeded, Paused: true}
+			if got := checkpointIn(t, writes[0].Data); got != want {
+				t.Errorf("wrote checkpoint %+v, want %+v; the resume must restore succeeded rather than re-execute the plan", got, want)
+			}
+			if _, ok := writes[0].Data[AppliedOutputKey]; ok {
+				t.Errorf("expected applied-output NOT to be materialised when there is no one-time output, got %q",
+					writes[0].Data[AppliedOutputKey])
+			}
+		})
+	}
+}
+
 // TestReconcileSecretResumeAbandonedWhenANewerPlanLanded is a regression test for a destructive
 // race, not a tidiness rule.
 //

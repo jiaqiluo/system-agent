@@ -319,7 +319,7 @@ func (w *watcher) recordInterruptAtEntry(sc corecontrollers.SecretController, se
 	if interrupt == applyinator.InterruptionCanceled && len(updates) > 0 {
 		// An empty map means the write-once guard suppressed the record, so there is no fresh
 		// cancellation to warn about.
-		warnOnPartialCancellation(parsePlanProgress(secret.Data, cp.Checksum).Completed, total)
+		partialCancellationLogs(parsePlanProgress(secret.Data, cp.Checksum).Completed, total)
 	}
 
 	// An interrupt suppresses execution, never observation. Merged into the same map so one
@@ -346,6 +346,35 @@ func (w *watcher) recordInterruptAtEntry(sc corecontrollers.SecretController, se
 func (w *watcher) recordInterruptAfterApply(sc corecontrollers.SecretController, secret *corev1.Secret, cp applyinator.CalculatedPlan,
 	effectiveState planapi.PlanState, needsApplied bool, applyOutput applyinator.ApplyOutput, probeStatuses map[string]planapi.ProbeStatus,
 ) (*corev1.Secret, error) {
+	if applyOutput.Interruption == applyinator.InterruptionCanceled && effectiveState.IsTerminal() {
+		// Cancel's write-once guard, the same rule handleCancellation applies at reconcile entry
+		// and for the same reason: a terminal plan-state is the orchestrator's to move off, and
+		// cancel is itself terminal, so re-reporting it would be a permanent downgrade of a plan
+		// that genuinely converged. This path is reachable without it: a succeeded plan still runs
+		// its periodic instructions on every reconcile, so a cancel landing during that apply
+		// would write plan-state: cancelled where the identical cancel landing a moment earlier,
+		// at reconcile entry, writes nothing at all.
+		//
+		// Deliberately cancel-only. A pause must still be recorded on a terminal plan-state:
+		// pausing a succeeded node that is only running periodic instructions is the likeliest
+		// operator action of all, and the checkpoint written here is what the resume reads back.
+		//
+		// Observation is not suppressed, only the lifecycle write — as everywhere else on the
+		// interrupt paths.
+		logrus.Debugf("[k8splan] plan-state is %q (terminal); not recording the cancellation of the interrupted apply", effectiveState)
+		updates := map[string][]byte{}
+		mergeProbeStatuses(updates, cp.Plan.Probes, probeStatuses)
+		committed, err := w.writeInterruptOutcome(sc, cp.Checksum, updates)
+		if err != nil {
+			return secret, fmt.Errorf("failed to record the probe statuses of the interrupted apply: %w", err)
+		}
+		sc.EnqueueAfter(w.connInfo.Namespace, w.connInfo.SecretName, interruptedEnqueuePeriod)
+		if committed != nil {
+			return committed, nil
+		}
+		return secret, nil
+	}
+
 	progress := planProgress{Checksum: cp.Checksum}
 	if needsApplied {
 		// The one-time set was running, so the Secret was already transitioned to in-progress
@@ -367,15 +396,22 @@ func (w *watcher) recordInterruptAfterApply(sc corecontrollers.SecretController,
 		state = planapi.PlanStateCancelled
 		progress.Paused = false
 		progress.ResumeState = ""
-		warnOnPartialCancellation(progress.Completed, progress.Total)
+		partialCancellationLogs(progress.Completed, progress.Total)
 	}
 
 	updates := map[string][]byte{
 		planapi.PlanStateKey: []byte(state),
 		PlanProgressKey:      marshalPlanProgress(progress),
+	}
+	if len(applyOutput.OneTimeOutput) > 0 {
 		// applied-output is what selectExistingOutput feeds back as ExistingOneTimeOutput next
 		// time, so the SaveOutput results of the instructions that did complete survive the hold.
-		AppliedOutputKey: applyOutput.OneTimeOutput,
+		//
+		// Written only when there is something to write. On the periodic-only path OneTimeOutput
+		// is selectExistingOutput's empty slice, and materialising an empty applied-output on a
+		// Secret that never had one is a key the agent does not own — the same class of change
+		// the plan-progress clear is deliberately gated against.
+		updates[AppliedOutputKey] = applyOutput.OneTimeOutput
 	}
 	mergeProbeStatuses(updates, cp.Plan.Probes, probeStatuses)
 
@@ -431,10 +467,12 @@ func mergeProbeStatuses(updates map[string][]byte, probes map[string]planapi.Pro
 	updates[ProbeStatusesKey] = marshalled
 }
 
-// warnOnPartialCancellation reports a cancellation that landed between instructions, which is the
+// partialCancellationLogs reports a cancellation that landed between instructions, which is the
 // one interrupt outcome an operator has to act on: the plan is terminal, so nothing will finish
-// what it started.
-func warnOnPartialCancellation(completed, total int) {
+// what it started. It returns a log rather than emitting one so the entry path can fold it into
+// handleCancellation's decision logs, which is also what ties it to the write-once guard: a
+// suppressed cancellation returns before the warning is built, so it is never re-warned.
+func partialCancellationLogs(completed, total int) {
 	if completed <= 0 || completed >= total {
 		return
 	}
