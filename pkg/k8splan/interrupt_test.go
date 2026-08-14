@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"maps"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -70,8 +71,14 @@ func TestParseInterruptAnnotation(t *testing.T) {
 			}
 			// The message has to be actionable on its own: an operator reading it from journalctl
 			// needs to know which annotation is wrong, what it currently says, and what it may say.
+			//
+			// The offending value is asserted quoted rather than raw. A raw substring check is
+			// vacuous for the present-but-empty row — strings.Contains(msg, "") is always true —
+			// which is exactly the row where "the message names the value" is hardest to get
+			// right and most needed, since an unquoted empty value renders as nothing at all.
 			msg := err.Error()
-			for _, want := range []string{PlanPausedAnnotation, tt.annotations[PlanPausedAnnotation], `"true"`, `"false"`} {
+			wants := []string{PlanPausedAnnotation, strconv.Quote(tt.annotations[PlanPausedAnnotation]), `"true"`, `"false"`}
+			for _, want := range wants {
 				if !strings.Contains(msg, want) {
 					t.Errorf("error message %q does not mention %q", msg, want)
 				}
@@ -204,6 +211,27 @@ func decodeProgress(t *testing.T, updates map[string][]byte) planProgress {
 	return p
 }
 
+// assertDecisionLogged asserts that some entry in logs contains want AND carries level. Both
+// halves matter and neither is sufficient alone: the message is what other suites match on, and
+// the level is what decides whether an operator ever sees it at the default log level. An empty
+// want skips the assertion.
+func assertDecisionLogged(t *testing.T, logs []decisionLog, want string, level decisionLevel) {
+	t.Helper()
+
+	if want == "" {
+		return
+	}
+	for _, entry := range logs {
+		if strings.Contains(entry.Message, want) {
+			if entry.Level != level {
+				t.Errorf("log %q was emitted at level %d, want %d", entry.Message, entry.Level, level)
+			}
+			return
+		}
+	}
+	t.Errorf("no decision log contains %q; got %v", want, logs)
+}
+
 func TestHandleInterrupt(t *testing.T) {
 	t.Parallel()
 
@@ -216,12 +244,22 @@ func TestHandleInterrupt(t *testing.T) {
 		wantEmpty        bool
 		wantPlanState    planapi.PlanState
 		wantProgress     planProgress
+		// wantInMessage is a substring at least one decision log must contain. Rows that name one
+		// are rows whose exact wording something outside this package depends on, or where the
+		// level is the whole point; "" skips the assertion.
+		wantInMessage string
+		// wantLevel is the level the log carrying wantInMessage must be emitted at. The design
+		// distinguishes info for a recorded interrupt from debug for a suppressed one, and without
+		// this an info -> debug flip would make a real pause invisible in a default-level
+		// journalctl while every assertion here still passed.
+		wantLevel decisionLevel
 	}{
 		{
 			name:      "cancelling a pending plan records the cancellation",
 			interrupt: applyinator.InterruptionCanceled, currentPlanState: planapi.PlanStatePending, total: 4,
 			wantPlanState: planapi.PlanStateCancelled,
 			wantProgress:  planProgress{Checksum: progressChecksum, Completed: 0, Total: 4},
+			wantInMessage: "recording plan-state", wantLevel: decisionInfo,
 		},
 		{
 			name:      "cancelling an in-progress plan records the cancellation",
@@ -237,17 +275,22 @@ func TestHandleInterrupt(t *testing.T) {
 			}),
 			wantPlanState: planapi.PlanStateCancelled,
 			wantProgress:  planProgress{Checksum: progressChecksum, Completed: 3, Total: 4, ResumeState: "", Paused: false},
+			// A cancellation that landed between instructions is the one outcome an operator has
+			// to act on, so it must reach a default-level journalctl.
+			wantInMessage: "may be left in an inconsistent state", wantLevel: decisionWarn,
 		},
 		{
 			name:      "cancelling a succeeded plan writes nothing: it is already terminal",
 			interrupt: applyinator.InterruptionCanceled, currentPlanState: planapi.PlanStateSucceeded, total: 4,
-			wantEmpty: true,
+			wantEmpty:     true,
+			wantInMessage: "not recording the cancellation", wantLevel: decisionDebug,
 		},
 		{
 			name:      "cancelling an already cancelled plan writes nothing: the write-once rule",
 			interrupt: applyinator.InterruptionCanceled, currentPlanState: planapi.PlanStateCancelled, total: 4,
-			data:      progressData(planProgress{Checksum: progressChecksum, Completed: 3, Total: 4}),
-			wantEmpty: true,
+			data:          progressData(planProgress{Checksum: progressChecksum, Completed: 3, Total: 4}),
+			wantEmpty:     true,
+			wantInMessage: "not recording the cancellation", wantLevel: decisionDebug,
 		},
 		{
 			name:      "pausing a pending plan resumes into pending",
@@ -260,6 +303,7 @@ func TestHandleInterrupt(t *testing.T) {
 			interrupt: applyinator.InterruptionPaused, currentPlanState: planapi.PlanStateInProgress, total: 4,
 			wantPlanState: PlanStatePaused,
 			wantProgress:  planProgress{Checksum: progressChecksum, Completed: 0, Total: 4, ResumeState: planapi.PlanStateInProgress, Paused: true},
+			wantInMessage: "holding the plan at", wantLevel: decisionInfo,
 		},
 		{
 			// A pause landing on a plan that is only running periodic instructions must not
@@ -280,6 +324,12 @@ func TestHandleInterrupt(t *testing.T) {
 			interrupt: applyinator.InterruptionPaused, currentPlanState: PlanStatePaused, total: 4,
 			data:      progressData(planProgress{Checksum: progressChecksum, Completed: 2, Total: 4, ResumeState: planapi.PlanStateInProgress, Paused: true}),
 			wantEmpty: true,
+			// This exact wording is load-bearing outside this package: it is the only positive
+			// liveness signal the e2e restart spec has that the restarted agent reconciled the
+			// held plan at all (test/e2e/suites/remote-plan/pause_test.go). Rewording it without
+			// updating that spec breaks a suite that runs in a different environment, so pin it
+			// here where `make test` guards it.
+			wantInMessage: "suspension already recorded for checksum", wantLevel: decisionDebug,
 		},
 		{
 			// The guard keys off the checkpoint, not off plan-state: plan-state paused with no
@@ -313,6 +363,7 @@ func TestHandleInterrupt(t *testing.T) {
 			if len(logs) == 0 {
 				t.Error("expected the decision to be explained by at least one log entry")
 			}
+			assertDecisionLogged(t, logs, tt.wantInMessage, tt.wantLevel)
 			if tt.wantEmpty {
 				if len(updates) != 0 {
 					t.Fatalf("expected no Secret writes, got %d keys: %v", len(updates), updates)
@@ -803,12 +854,11 @@ func TestWriteInterruptOutcomeReturnsErrorsRatherThanExiting(t *testing.T) {
 	planBytes, checksum := interruptTestPlan(t, "ok")
 
 	tests := []struct {
-		name     string
-		getErr   error
-		updateOK bool
+		name   string
+		getErr error
 	}{
 		{name: "a failing Get is returned", getErr: errors.New("etcd is unavailable")},
-		{name: "a non-conflict Update error is returned", updateOK: false},
+		{name: "a non-conflict Update error is returned"},
 	}
 
 	for _, tt := range tests {
