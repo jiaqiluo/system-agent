@@ -1914,6 +1914,26 @@ func startWatchedCommand(t *testing.T, trapAction string) (context.CancelFunc, *
 	return cancel, pipe, waited, stop
 }
 
+// withTerminationGrace shortens the watchdog's escalation grace for the duration of the test and
+// restores it afterwards.
+//
+// The t.Setenv call sets nothing anybody reads: it is a tripwire. t.Setenv panics if the test, or
+// any ancestor of it, has called t.Parallel() — which is exactly the condition under which writing
+// this package-level var from a test becomes a data race with every other watchdog the package
+// arms. CI runs no -race job, so this panic is the only thing that would catch a future parallel
+// test reaching for this helper.
+//
+// Call it before anything whose cleanup reads the var — the watchdog's own cancel()/stop() — so
+// LIFO restores the original only after those have finished.
+func withTerminationGrace(t *testing.T, d time.Duration) {
+	t.Helper()
+	t.Setenv("APPLYINATOR_GRACE_GUARD", "1")
+
+	original := instructionTerminationGrace
+	instructionTerminationGrace = d
+	t.Cleanup(func() { instructionTerminationGrace = original })
+}
+
 // TestWatchForTerminationClosesThePipesOnlyWhenItEscalates pins both halves of the watchdog's pipe
 // handling, which is the one part of it a cancelled Apply cannot observe: on Unix the graceful
 // SIGTERM already reaches the whole process group, so the pipes reach EOF on their own and closing
@@ -1925,7 +1945,8 @@ func startWatchedCommand(t *testing.T, trapAction string) (context.CancelFunc, *
 //
 // Not parallel: it rewrites the package-level instructionTerminationGrace, and Go runs every
 // non-parallel test body to completion before resuming any parallel one, so this cannot race with
-// the watchdogs the other tests arm.
+// the watchdogs the other tests arm. withTerminationGrace enforces that rather than merely
+// documenting it.
 func TestWatchForTerminationClosesThePipesOnlyWhenItEscalates(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("requires a POSIX shell")
@@ -1957,9 +1978,9 @@ func TestWatchForTerminationClosesThePipesOnlyWhenItEscalates(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			original := instructionTerminationGrace
-			instructionTerminationGrace = tc.grace
-			t.Cleanup(func() { instructionTerminationGrace = original })
+			// Registered before startWatchedCommand, whose cleanup cancels the watchdog and waits
+			// for it: LIFO means the grace is restored only once nothing is still reading it.
+			withTerminationGrace(t, tc.grace)
 
 			cancel, pipe, waited, stop := startWatchedCommand(t, tc.trapAction)
 
