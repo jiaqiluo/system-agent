@@ -55,11 +55,11 @@ const deleteFileAction = "delete"
 const defaultEffectivePeriod = 600 // 10 minutes
 const defaultFailureCooldown = 6
 
-// instructionTerminationGrace is how long a cancelled instruction's process tree is given to exit
-// after a graceful signal before it is killed outright.
+// instructionTerminationGrace is the time allowed for a cancelled instruction's process tree to
+// exit after a graceful termination signal before it is forcefully killed.
 //
-// A var rather than a const so that tests can shorten it: the escalation path, which is where the
-// pipe close lives, is otherwise only reachable after a real ten-second wait.
+// It is a variable rather than a constant so tests can shorten the interval and exercise the
+// escalation path without waiting the full default duration.
 var instructionTerminationGrace = 10 * time.Second
 
 func NewApplyinator(workDir string, preserveWorkDir bool, appliedPlanDir, interlockDir string, imageUtil *image.Utility) *Applyinator {
@@ -84,7 +84,7 @@ func CalculatePlan(rawPlan []byte) (CalculatedPlan, error) {
 	}, nil
 }
 
-// Interruption reports why an apply stopped short of completing normally.
+// Interruption reports why an apply operation stopped before completing normally.
 type Interruption string
 
 const (
@@ -96,11 +96,11 @@ const (
 	InterruptionCanceled Interruption = "canceled"
 )
 
-// checkInterruption reports which interruption, if any, is already pending. It never blocks, and
-// a nil channel is never ready. Cancel is tested first: cancel wins over pause.
+// checkInterruption reports any interruption that is already pending. It never blocks, and a nil
+// channel is never ready. Cancellation takes precedence over pause.
 func checkInterruption(cancel, pause <-chan struct{}) Interruption {
-	// A select over two ready channels picks pseudo-randomly, so cancel's precedence over pause
-	// has to be an explicit prior check rather than case ordering.
+	// When both channels are ready, select chooses between them pseudo-randomly, so cancellation
+	// must be checked separately to guarantee its precedence over pause.
 	select {
 	case <-cancel:
 		return InterruptionCanceled
@@ -123,11 +123,9 @@ type ApplyOutput struct {
 	PeriodicApplySucceeded bool
 	// Interruption is InterruptionNone unless the apply stopped early.
 	Interruption Interruption
-	// CompletedOneTimeInstructions is an ABSOLUTE count over the plan's one-time instructions,
-	// not a count of what this apply ran: the loop starts at
-	// ApplyInput.ResumeFromOneTimeInstruction and reports index+1. A plan paused after
-	// instruction 2, resumed, and paused again three instructions later therefore reports 5, not
-	// 3 — successive pause/resume cycles compose instead of resetting.
+	// CompletedOneTimeInstructions is the absolute number of one-time instructions completed
+	// across the entire plan, not the number completed by this apply. This allows successive
+	// pause/resume cycles to preserve and build on the same checkpoint.
 	CompletedOneTimeInstructions int
 }
 
@@ -138,32 +136,33 @@ type ApplyInput struct {
 	ReconcileFiles             bool
 	ExistingOneTimeOutput      []byte
 	ExistingPeriodicOutput     []byte
-	// Cancel, when closed, abandons the apply as promptly as possible: the in-flight
-	// instruction's context is cancelled and no further instruction is started. A nil channel
-	// is never ready, so the zero value means "never cancelled".
+	// Cancel, when closed, cancels the in-flight instruction's context and prevents any further
+	// instruction from starting. A nil channel is never ready, so the zero value means "never canceled".
 	Cancel <-chan struct{}
-	// Pause, when closed, stops the apply at the next instruction boundary. It never interrupts
-	// a running instruction: a checkpoint is only trustworthy if every instruction below
-	// ApplyOutput.CompletedOneTimeInstructions ran to completion. A nil channel is never ready.
+	// Pause, when closed, stops the apply at the next instruction boundary. It never interrupts a
+	// running instruction, ensuring that every instruction counted by ApplyOutput.CompletedOneTimeInstructions
+	// has completed successfully. A nil channel is never ready.
 	Pause <-chan struct{}
 	// ResumeFromOneTimeInstruction is the index of the first one-time instruction to execute.
-	// Instructions below it are treated as already complete and are not re-run. Zero (the zero
-	// value) starts from the beginning.
+	// Instructions before this index are treated as already completed and are not re-run. Zero,
+	// the zero value, starts execution from the beginning.
 	ResumeFromOneTimeInstruction int
 }
 
-// Apply reconciles the local system against input.CalculatedPlan: it honors the interlock, archives the plan,
-// reconciles files, optionally runs one-time instructions, and always runs due periodic instructions. It returns
-// the updated one-time and periodic outputs (gzip+JSON encoded) alongside their success flags. Notably,
-// ApplyOutput.OneTimeApplySucceeded will be false if ApplyInput.RunOneTimeInstructions is false.
+// Apply reconciles the local system with input.CalculatedPlan. It honors the interlock, archives the plan,
+// reconciles files, optionally runs one-time instructions, and always runs due periodic instructions. It
+// returns the updated one-time and periodic outputs as gzip+JSON, along with their success flags.
+// ApplyOutput.OneTimeApplySucceeded is false when ApplyInput.RunOneTimeInstructions is false.
 //
-// An apply can be interrupted by the operator through input.Cancel and input.Pause. Cancel is prompt: it cancels
-// the in-flight instruction's context and starts nothing further. Pause is a boundary: it never interrupts a
-// running instruction, it only stops before the next one starts. Either way ApplyOutput.Interruption reports why
-// the apply stopped and ApplyOutput.CompletedOneTimeInstructions records the resume checkpoint — the absolute
-// number of one-time instructions known to have run to completion. Passing that value back as
-// ApplyInput.ResumeFromOneTimeInstruction on a later apply resumes the plan without re-running them. An
-// interrupted apply is a reported outcome, not a failure: the returned error stays nil.
+// Apply can be interrupted through input.Cancel or input.Pause. Cancel is prompt: it cancels the context of
+// the running instruction and prevents any further instructions from starting. Pause takes effect at a
+// boundary: it allows the current instruction to finish but prevents the next one from starting.
+//
+// When interrupted, ApplyOutput.Interruption reports the reason and
+// ApplyOutput.CompletedOneTimeInstructions records the resume checkpoint: the absolute number of one-time
+// instructions known to have completed. Passing that value as ApplyInput.ResumeFromOneTimeInstruction on a
+// later apply resumes the plan without re-running completed instructions. An interrupted apply is a reported
+// outcome, not a failure, so Apply returns a nil error.
 func (a *Applyinator) Apply(ctx context.Context, input ApplyInput) (ApplyOutput, error) {
 	logrus.Debugf("[applyinator] applying plan with checksum %s", input.CalculatedPlan.Checksum)
 	output := ApplyOutput{
@@ -171,17 +170,6 @@ func (a *Applyinator) Apply(ctx context.Context, input ApplyInput) (ApplyOutput,
 		PeriodicOutput:               input.ExistingPeriodicOutput,
 		CompletedOneTimeInstructions: input.ResumeFromOneTimeInstruction,
 	}
-
-	// This check has to happen before the lock, not merely before the file reconciliation: an apply that is
-	// already cancelled must not queue behind an in-flight apply on the mutex, and must not sit in
-	// checkInterlock's restart-pending wait for up to restartPendingTimeout only to return an error instead of
-	// a clean InterruptionCanceled.
-	//
-	// It is a contract on ApplyInput, not a path production exercises today: pkg/k8splan's only caller hands
-	// over channels its interrupt watch has just created and cannot have closed yet, and pkg/localplan passes
-	// nil. Its coverage is the unit tests, so do not read production reachability into it — and do not delete
-	// it on the strength of that, either. It is what makes "an already-interrupted ApplyInput is a reported
-	// outcome, not a wait" true for any caller.
 	if interruption := checkInterruption(input.Cancel, input.Pause); interruption != InterruptionNone {
 		logrus.Infof("[applyinator] not applying plan with checksum %s: %s before the apply started", input.CalculatedPlan.Checksum, interruption)
 		output.Interruption = interruption
@@ -201,8 +189,8 @@ func (a *Applyinator) Apply(ctx context.Context, input ApplyInput) (ApplyOutput,
 	}
 	defer cleanupInterlock()
 
-	// execCtx is the context handed to instruction execution. It is cancelled when input.Cancel closes, which
-	// is what makes a cancel prompt rather than a boundary.
+	// execCtx is passed to instruction execution and is canceled when input.Cancel closes, allowing
+	// cancellation to interrupt a running instruction rather than waiting for the next boundary.
 	execCtx, cancelExec := context.WithCancel(ctx)
 	defer cancelExec()
 	if input.Cancel != nil {
@@ -255,8 +243,8 @@ func (a *Applyinator) Apply(ctx context.Context, input ApplyInput) (ApplyOutput,
 		output.OneTimeApplySucceeded = oneTime.Succeeded
 		output.CompletedOneTimeInstructions = oneTime.Completed
 		if oneTime.Interruption != InterruptionNone {
-			// An interrupt suppresses execution: running periodic instructions after abandoning the
-			// one-time set would execute work the operator asked to stop.
+			// An interrupt suppresses periodic instructions as well. Once the operator has stopped the apply,
+			// no additional work should start after the one-time instructions are abandoned.
 			output.Interruption = oneTime.Interruption
 			return output, nil
 		}
@@ -383,18 +371,19 @@ func instructionExecutionDir(baseDir, checksum string, index int) (dir, prefix s
 type oneTimeResult struct {
 	Output    []byte
 	Succeeded bool
-	// Completed is absolute: the index of the last instruction that returned, plus one.
+	// Completed is the absolute number of one-time instructions completed so far: the index of
+	// the last instruction that returned, plus one.
 	Completed int
-	// Interruption is InterruptionNone unless the pass stopped early.
+	// Interruption is InterruptionNone unless execution stopped before all instructions completed.
 	Interruption Interruption
 }
 
-// runOneTimeInstructions executes one-time instructions in order.
-// It stops at the first failure.
-// It returns the updated gzip+JSON encoded saved-output map and a success flag.
+// runOneTimeInstructions executes one-time instructions in order, starting at resumeFrom. It stops
+// at the first failure or when cancel or pause is pending at an instruction boundary, and returns
+// the updated gzip+JSON saved-output map together with the resume checkpoint. Instructions before
+// resumeFrom are treated as already completed and are not re-run.
 func (a *Applyinator) runOneTimeInstructions(ctx context.Context, executionDir string, cp CalculatedPlan, existingOutput []byte,
-	attempts, resumeFrom int, cancel, pause <-chan struct{},
-) (oneTimeResult, error) {
+	attempts, resumeFrom int, cancel, pause <-chan struct{}) (oneTimeResult, error) {
 	logrus.Infof("[applyinator] applying one-time instructions for plan with checksum %s starting at instruction %d", cp.Checksum, resumeFrom)
 	executionOutputs := map[string][]byte{}
 	if err := decodeGzipJSON(existingOutput, &executionOutputs); err != nil {
@@ -402,8 +391,6 @@ func (a *Applyinator) runOneTimeInstructions(ctx context.Context, executionDir s
 	}
 
 	if resumeFrom < 0 {
-		// Defensive: a negative resume index would panic on the instruction lookup below. There is no
-		// meaningful checkpoint before the first instruction, so start from the beginning.
 		logrus.Warnf("[applyinator] negative resume index %d for plan %s, starting from the first instruction", resumeFrom, cp.Checksum)
 		resumeFrom = 0
 	}
@@ -425,21 +412,20 @@ func (a *Applyinator) runOneTimeInstructions(ctx context.Context, executionDir s
 			logrus.Errorf("[applyinator] error executing instruction %d: %v", index, err)
 			result.Succeeded = false
 		}
-		// Output from a killed or failed instruction is still worth saving, so this stays ahead of the break.
+		// Save output even when the instruction fails or is killed, so any output it produced is preserved.
 		if instruction.Name == "" && instruction.SaveOutput {
 			logrus.Errorf("[applyinator] instruction does not have a name set, cannot save output data")
 		} else if instruction.SaveOutput {
 			executionOutputs[instruction.Name] = executeOutput
 		}
-		// If we have failed to apply our one-time instructions, we need to break in order to stop subsequent
-		// instructions from executing.
+		// Stop after the first failed instruction; subsequent instructions must not execute.
 		if failed {
-			// A cancel kills the in-flight instruction, so re-check: a cancel-induced kill must be reported
-			// as an interruption rather than as a plan failure. A pause never interrupts a running
-			// instruction, so a pause observed here did not cause the failure -- the instruction genuinely
-			// failed and Succeeded stays false -- but it still stops the loop.
+			// A canceled instruction may fail because its context was killed. Re-check the interrupt
+			// state so cancellation is reported as an interruption rather than a plan failure.
+			// Pause does not interrupt a running instruction, so a failure observed with pause pending
+			// is still a genuine instruction failure.
 			result.Interruption = checkInterruption(cancel, pause)
-			// Completed does not advance past a failed instruction.
+			// The failed instruction did not complete, so do not advance the checkpoint.
 			break
 		}
 		result.Completed = index + 1
@@ -456,9 +442,12 @@ func (a *Applyinator) runOneTimeInstructions(ctx context.Context, executionDir s
 // runPeriodicInstructions executes each due periodic instruction.
 // It returns the updated gzip+JSON encoded periodic-output map and a success flag.
 // Set ranOneTime to force every instruction to run regardless of period and cooldown.
+//
+// Periodic instructions have no resume checkpoint. If cancel or pause becomes pending, execution
+// stops before the next instruction, and the caller re-checks the interruption channels to determine
+// whether the apply was interrupted.
 func (a *Applyinator) runPeriodicInstructions(ctx context.Context, executionDir string, cp CalculatedPlan, existingOutput []byte,
-	ranOneTime bool, now time.Time, cancel, pause <-chan struct{},
-) ([]byte, bool, error) {
+	ranOneTime bool, now time.Time, cancel, pause <-chan struct{}) ([]byte, bool, error) {
 	nowUnixTimeString := now.Format(time.UnixDate)
 
 	periodicOutputs := map[string]planapi.PeriodicInstructionOutput{}
@@ -688,20 +677,20 @@ func (a *Applyinator) writePlanToDisk(now time.Time, plan *CalculatedPlan) error
 	return writeContentToFile(filepath.Join(a.appliedPlanDir, file), os.Getuid(), os.Getgid(), 0600, anpString)
 }
 
-// execute stages the instruction's execution directory, runs its command, and returns the captured
-// stdout, stderr, exit code and wait error.
+// execute stages the instruction's execution directory, runs its command, and returns captured
+// stdout, stderr, the exit code, and any wait error.
 //
-// The command is put into a process group (Unix) or Job Object (Windows) of its own, and a watchdog
-// is armed on ctx: when ctx is cancelled the whole process tree is signalled to terminate and, if
-// it has not exited within instructionTerminationGrace, killed. Signalling only the direct child
-// would leave the installer or package manager that a typical run.sh shells out to still running.
+// The command runs in its own process group on Unix or Job Object on Windows. A watchdog monitors
+// ctx and, when canceled, signals the entire process tree to terminate. If the tree does not exit
+// within instructionTerminationGrace, it is killed. Signaling the whole tree prevents child
+// processes such as installers or package managers launched by a shell script from surviving
+// cancellation.
 func (a *Applyinator) execute(ctx context.Context, prefix, executionDir string, instruction planapi.CommonInstruction, combinedOutput bool, attempt int) ([]byte, []byte, int, error) {
 	if instruction.Image == "" {
 		logrus.Infof("[applyinator] no image provided, creating empty working directory %s", executionDir)
-		// UID/GID -1 means "don't change ownership" (a no-op chown). Without this, the directory
-		// defaults to UID/GID 0 (root) — harmless in production, where the agent always runs as
-		// root, but it makes this code unusable from a non-root test process (os.Chown to a
-		// different owner than the caller returns "operation not permitted").
+		// UID/GID -1 means "leave ownership unchanged". This avoids requiring root when tests run
+		// under a non-root user, while production still creates the directory with the caller's
+		// existing ownership.
 		if err := createDirectory(planapi.File{Directory: true, Path: executionDir, UID: -1, GID: -1}); err != nil {
 			logrus.Errorf("[applyinator] error while creating empty working directory: %v", err)
 			return nil, nil, -1, err
@@ -744,8 +733,8 @@ func (a *Applyinator) execute(ctx context.Context, prefix, executionDir string, 
 	}
 	defer stderr.Close()
 
-	// Before Start: SysProcAttr is only read at fork time. A failure here must not stop the
-	// instruction from running at all, it only degrades cancellation to a direct-child signal.
+	// SysProcAttr is read when the process starts. If process-group setup fails here, continue
+	// without it so execution still proceeds; cancellation will then signal only the direct child.
 	if err := configureProcessGroup(cmd); err != nil {
 		logrus.Errorf("[applyinator] error configuring the process group for %s: %v; cancelling it will only signal its direct child", command, err)
 	}
@@ -781,15 +770,14 @@ func (a *Applyinator) execute(ctx context.Context, prefix, executionDir string, 
 	})
 
 	if err := cmd.Start(); err != nil {
-		// The watchdog is never armed on this path, so nothing else would release the platform
-		// handle configureProcessGroup may have created. releaseProcessTree is idempotent and a
-		// no-op when no handle was recorded.
+		// The watchdog is not running yet, so release any process-tree handle created during setup.
+		// releaseProcessTree is idempotent and is a no-op when no handle was recorded.
 		releaseProcessTree(cmd)
 		return nil, nil, -1, err
 	}
 
-	// After Start: Windows can only assign a process to a Job Object once it exists. Degrades the
-	// same way as configureProcessGroup above.
+	// Windows assigns the process to its Job Object only after the process starts. If assignment
+	// fails, continue with direct-child cancellation as the fallback.
 	if err := assignProcessTree(cmd); err != nil {
 		logrus.Errorf("[applyinator] error assigning %s to its process tree: %v; cancelling it will only signal its direct child", command, err)
 	}
@@ -815,13 +803,17 @@ func (a *Applyinator) execute(ctx context.Context, prefix, executionDir string, 
 	return stdoutTarget.Bytes(), stderrTarget.Bytes(), exitCode, waitErr
 }
 
-// watchForTermination signals cmd's process tree once ctx is done: a graceful signal first,
-// escalating to an unconditional kill after instructionTerminationGrace. The pipes are closed
-// alongside the kill so streamLogs cannot block forever on a descendant that inherited them. The
-// returned func stops the watchdog and releases any platform handles; callers must defer it.
+// watchForTermination monitors ctx and terminates cmd's process tree when cancellation occurs.
+// It sends a graceful termination signal first, then force-kills the tree if it has not exited
+// within instructionTerminationGrace. The pipes are closed only after forced termination so
+// streamLogs cannot remain blocked on descendants that inherited the pipe handles.
+//
+// The returned function stops the watchdog and releases any platform-specific process-tree
+// handles. Callers must defer it.
 func watchForTermination(ctx context.Context, cmd *exec.Cmd, pipes ...io.Closer) func() {
-	// done is closed by the returned func; finished is closed by the watchdog on its way out, so
-	// the returned func can be sure nothing is still signalling before it releases the handles.
+	// done is closed by the returned stop function; finished is closed when the watchdog exits.
+	// Waiting for finished ensures no termination work remains before process-tree handles are
+	// released.
 	done := make(chan struct{})
 	finished := make(chan struct{})
 
@@ -830,7 +822,7 @@ func watchForTermination(ctx context.Context, cmd *exec.Cmd, pipes ...io.Closer)
 
 		select {
 		case <-done:
-			// The instruction finished on its own; there is nothing to terminate.
+			// The instruction completed normally; there is nothing to terminate.
 			return
 		case <-ctx.Done():
 		}
@@ -845,10 +837,10 @@ func watchForTermination(ctx context.Context, cmd *exec.Cmd, pipes ...io.Closer)
 			logrus.Warnf("[applyinator] error terminating the process tree of pid %d: %v", pid, err)
 		}
 
-		// This wait has a process-exit arm, not just the timer: execute defers stop(), so done is
-		// closed as soon as cmd.Wait() returns. A terminateProcessTree that actually terminates the
-		// tree rather than asking it nicely — which is what Windows does, having no graceful signal
-		// to send — therefore short-circuits the grace period instead of stalling on it.
+		// Wait for either the process to finish or the grace period to expire. execute defers
+		// stop(), which closes done after cmd.Wait() returns, so a process that exits promptly
+		// avoids the full grace period. This also handles platforms where terminateProcessTree
+		// kills the tree immediately, such as Windows where no graceful signal is available.
 		select {
 		case <-done:
 			// The tree is gone: either it took the hint, or terminateProcessTree killed it outright.
@@ -861,12 +853,11 @@ func watchForTermination(ctx context.Context, cmd *exec.Cmd, pipes ...io.Closer)
 			logrus.Warnf("[applyinator] error killing the process tree of pid %d: %v", pid, err)
 		}
 
-		// execute calls eg.Wait() before cmd.Wait(), and eg.Wait() only returns once both pipes
-		// reach EOF. A killed shell's grandchild inherits the write ends of those pipes, so without
-		// an explicit close here the apply hangs forever on a descendant the kill did not reach.
-		// This deliberately does not happen on the graceful path above, so a well-behaved
-		// instruction's final output is not truncated. Close errors are ignored: cmd.Wait() closes
-		// its own copies and a double close returns os.ErrClosed, which is expected.
+		// execute waits for both output streams to reach EOF before calling cmd.Wait(). A
+		// descendant that inherited a pipe can keep those streams open even after the main process
+		// is killed, so close the pipes explicitly to unblock streamLogs. Do this only on the
+		// forced-kill path so output from a gracefully exiting instruction is not truncated.
+		// Close errors are ignored because cmd.Wait() may close the same descriptors afterward.
 		for _, pipe := range pipes {
 			_ = pipe.Close()
 		}

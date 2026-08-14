@@ -7,20 +7,21 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-// planProgress is the resume checkpoint the agent stores under PlanProgressKey. It is scoped to
-// the plan checksum and to nothing else: a checkpoint written by a previous agent lifetime is
-// honored, one written for a different plan is not. That is deliberate — an agent that restarts
-// while a plan is held must resume that plan where it stopped rather than re-run it.
+// planProgress is the resume checkpoint stored under PlanProgressKey. It is scoped only to the plan
+// checksum: a checkpoint from a previous agent lifetime is valid, while one from a different plan
+// is ignored. This allows an agent that restarts while a plan is paused to resume from where it
+// stopped instead of re-running the plan from the beginning.
 type planProgress struct {
 	Checksum    string            `json:"checksum"`
 	Completed   int               `json:"completedInstructions"`
 	Total       int               `json:"totalInstructions"`
 	ResumeState planapi.PlanState `json:"resumeState,omitempty"` // state restored when the pause lifts
-	// Paused marks the record as a *suspension* rather than a report, and is the sole gate on
-	// Completed being honored: only a suspended checkpoint grants a resume. The cancel paths write
-	// Paused: false records, which report how far the plan got and are never resumed from, and the
-	// resume commit clears the flag so a checkpoint stops granting a resume the moment the plan is
-	// no longer held.
+	// Paused identifies the record as a suspension rather than a status report and is the sole gate for
+	// honoring Completed as a resume checkpoint. Only a suspended checkpoint can be used to resume.
+	//
+	// Cancellation writes Paused: false, so its progress is recorded for reporting but is never resumed
+	// from. The resume commit also clears Paused, preventing the checkpoint from granting another resume
+	// once the plan is no longer suspended.
 	Paused bool `json:"paused,omitempty"`
 }
 
@@ -31,9 +32,9 @@ type planProgress struct {
 func parsePlanProgress(data map[string][]byte, checksum string) planProgress {
 	raw, ok := data[PlanProgressKey]
 	if !ok || len(raw) == 0 {
-		// An empty value is how the checkpoint is cleared, so it is absence, not corruption;
-		// decoding it would log a spurious error on every subsequent reconcile. Clearing it must
-		// be an empty value rather than a delete — see the comment on secretConflictMergeKeys.
+		// An empty value represents a cleared checkpoint, not malformed data. Treat it as absent to avoid
+		// logging a spurious decode error on every reconcile. The checkpoint must be cleared by writing an
+		// empty value rather than deleting the key; see secretConflictMergeKeys.
 		return planProgress{}
 	}
 	var p planProgress
@@ -61,15 +62,16 @@ func marshalPlanProgress(p planProgress) []byte {
 	return raw
 }
 
-// resolveResume maps a stored plan-state onto the state the reconcile should act on. A plan is
-// treated as suspended if plan-state says so *or* if a valid checkpoint claims it — the latter is
-// what keeps resume working across an agent restart, and when an external write has moved
-// plan-state out from under a checkpoint. Every other state passes through unchanged with
-// resumeFrom 0.
+// resolveResume determines the state and resume position for a reconcile based on the stored plan
+// state and checkpoint. A plan is considered suspended when either plan-state is paused or a valid
+// checkpoint claims the plan. The checkpoint case preserves resumability across agent restarts and
+// handles cases where an external write changed plan-state without clearing the checkpoint.
+// All other states pass through unchanged with resumeFrom set to 0.
 //
-// Precondition: the caller has already established that both interrupt annotations read as an
-// explicit false. This function describes how to *leave* a suspension, never whether to; a plan
-// that is still held — or whose annotation could not be parsed — never reaches it.
+// Precondition: both interrupt annotations have already been validated as explicitly false. This
+// function only determines how to leave an existing suspension; it does not decide whether the
+// plan may leave one. A plan that remains held, or whose annotation cannot be parsed, never reaches
+// this function.
 func resolveResume(state planapi.PlanState, data map[string][]byte, checksum string) (planapi.PlanState, int) {
 	if state == "" { // checksum flow: no checkpoint is ever written, nothing to resolve
 		return state, 0
@@ -87,15 +89,14 @@ func resolveResume(state planapi.PlanState, data map[string][]byte, checksum str
 	return orDefault(sanitizeResumeState(p.ResumeState), planapi.PlanStateInProgress), p.Completed
 }
 
-// sanitizeResumeState rejects a stored ResumeState of PlanStatePaused, treating it as unset so
-// orDefault's in-progress fallback takes over.
+// sanitizeResumeState rejects a stored ResumeState of PlanStatePaused and treats it as unset, allowing
+// orDefault to fall back to PlanStateInProgress.
 //
-// Resuming *into* paused is a silent permanent stall: decidePlanStateAction routes every state it
-// does not know to its terminal default branch, so the plan would never run again and never leave
-// paused, with no annotation left for an operator to remove. handleInterrupt already refuses to
-// write such a record; this is the reading half, for a hand-edited Secret or one written by a
-// build that predates that guard. Re-executing from instruction 0 is always safe; stalling
-// silently is not.
+// Resuming into paused would cause a silent permanent stall: decidePlanStateAction treats unknown
+// states as terminal, so the plan would never execute again or leave the paused state once the
+// annotation is removed. handleInterrupt prevents writing such a checkpoint; this guard handles
+// hand-edited Secrets and checkpoints written by older versions that lacked that protection.
+// Restarting from instruction 0 is safe; silently stalling is not.
 func sanitizeResumeState(state planapi.PlanState) planapi.PlanState {
 	if state != PlanStatePaused {
 		return state

@@ -63,13 +63,15 @@ const (
 	// TODO: upstream these into github.com/rancher/rancher/pkg/plan alongside PlanStateCancelled,
 	// then drop the local definitions and bump the dependency.
 
-	// PlanCancelledAnnotation, set to "true" on the plan Secret, requests that the agent abort the
-	// plan. Removing it does not un-cancel: the plan is terminal and waits for new content.
+	// PlanCancelledAnnotation is the Secret annotation used to cancel a plan.
+	// Setting it to "true" requests that the agent abort the plan.
+	// Removing the annotation does not resume the plan: cancellation is terminal and requires new content.
 	// The only valid values are "true" and "false"; see readInterrupt.
 	PlanCancelledAnnotation = "plan.cattle.io/cancelled"
-	// PlanPausedAnnotation, set to "true" on the plan Secret, requests that the agent hold
-	// execution. While it is set the agent executes nothing for this plan, whatever plan-state or
-	// the resume checkpoint say; clearing it is the only thing that resumes the plan.
+	// PlanPausedAnnotation is the Secret annotation used to pause a plan.
+	// Setting it to "true" requests that the agent stop executing the plan.
+	// While set, the agent performs no plan execution regardless of plan state or resume checkpoint.
+	// Clearing the annotation or setting it to "false" resumes the plan.
 	// The only valid values are "true" and "false"; see readInterrupt.
 	PlanPausedAnnotation = "plan.cattle.io/paused"
 	// PlanProgressKey is the Secret data key holding the resume checkpoint (JSON, see planProgress).
@@ -79,17 +81,16 @@ const (
 	cooldownTimerDuration = "30s"
 )
 
-// PlanStatePaused is a non-terminal plan-state: execution is held at an instruction boundary and
-// will resume into planProgress.ResumeState when the pause annotation is removed.
+// PlanStatePaused is a non-terminal plan state indicating that execution is held at an instruction
+// boundary. When the pause annotation is removed, execution resumes using planProgress.ResumeState.
 const PlanStatePaused planapi.PlanState = "paused"
 
-// secretConflictMergeKeys lists Secret data keys that updateSecret merges on conflict.
-// When retrying after an Update conflict, these keys are carried from the attempted write
-// into the freshly fetched secret before retrying the Update.
+// secretConflictMergeKeys lists the Secret data keys that updateSecret preserves from the attempted
+// write when retrying after an Update conflict.
 //
-// Clearing one of these keys must be written as an empty value, never as a delete: the merge loop
-// only carries over keys present in the in-hand copy, so a deleted key leaves the freshly-fetched
-// Secret's stale value in place and the clear is silently lost on a conflict retry.
+// These keys must be cleared by writing an empty value rather than deleting the key. The conflict
+// merge only carries forward keys present in the in-hand copy, so deleting a key would leave the
+// freshly fetched Secret's stale value intact and silently lose the clear during the retry.
 var secretConflictMergeKeys = []string{
 	ProbeStatusesKey,
 	AppliedPeriodicOutputKey,
@@ -215,16 +216,15 @@ func (w *watcher) updateSecret(sc corecontrollers.SecretController, secret *core
 							return false
 						}
 						if ck.Checksum == string(secret.Data[AppliedChecksumKey]) {
-							logrus.Debugf("[k8splan] secret %s/%s resource version changed from %s to %s but plan checksum still matches, updating latest secret", secret.Namespace, secret.Name, secret.ResourceVersion, latestSecret.ResourceVersion)
+							logrus.Debugf("[k8splan] secret %s/%s resource version changed from %s to %s but plan checksum still matches, updating latest secret",
+								secret.Namespace, secret.Name, secret.ResourceVersion, latestSecret.ResourceVersion)
 							// we can go ahead copy the relevant data out of the "old" secret and return true to let it update the secret.
-							// Defensive: the PlanKey lookup above means Data is non-nil today, but writing into a
-							// nil map panics, so do not depend on that.
 							if latestSecret.Data == nil {
 								latestSecret.Data = map[string][]byte{}
 							}
 							for _, key := range secretConflictMergeKeys {
-								// Only carry over keys the in-hand copy actually has: a key the agent never
-								// wrote must not be materialised as an empty value on the fresh object.
+								// Only carry over keys present in the in-hand copy. A key the agent did not write must not be
+								// introduced as an empty value into the freshly fetched object.
 								if v, ok := secret.Data[key]; ok {
 									latestSecret.Data[key] = v
 								}

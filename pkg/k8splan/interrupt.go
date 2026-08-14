@@ -18,34 +18,26 @@ import (
 	"k8s.io/client-go/util/retry"
 )
 
-// The suppression invariant this file exists to uphold:
+// This file enforces the plan-state execution invariant:
 //
-//	In the plan-state flow, the agent executes a plan only when both PlanPausedAnnotation and
-//	PlanCancelledAnnotation are unambiguously not set — absent, or present with the value "false".
-//	Anything else stops execution, no matter what plan-state says, no matter what the checkpoint
-//	says, no matter how the agent arrived at this reconcile.
+// The agent executes a plan only when both PlanPausedAnnotation and PlanCancelledAnnotation are
+// explicitly inactive: absent or set to "false". Any other value suppresses execution, regardless
+// of the plan state, checkpoint, or how the agent reached reconciliation.
 //
-// That is a whitelist of the two ways a plan may run, not a blacklist of the ways it is held: a
-// value the agent does not recognise falls on the stop side by construction rather than by an
-// explicit rule, which is what makes the invariant hold for values nobody anticipated. The failure
-// mode it guards against is not "pause does not work" — an operator sees that immediately — but
-// "pause works until the agent restarts, and then the plan runs anyway".
+// This is intentionally a whitelist of executable states rather than a blacklist of interrupted
+// states. Unknown values therefore fail closed and suppress execution without requiring an explicit
+// rule for every possible value. This protects against a particularly dangerous failure mode:
+// an interruption appears to work, but the plan executes after the agent restarts.
 //
-// An interrupt suppresses execution, never observation: while either annotation is set the agent
-// skips Apply but still runs probes and still persists probe statuses, because freezing probe
-// statuses would feed stale health data to Rancher's MachineHealthCheck on exactly the nodes most
-// likely to be unhealthy. handleInterrupt therefore returns only the lifecycle-key updates; the
-// caller merges the probe statuses into the same map.
+// An interrupt suppresses execution, not observation. While either annotation is active, the agent
+// skips Apply but continues running probes and persisting their statuses. This keeps health data
+// current for Rancher's MachineHealthCheck, especially for nodes that may be unhealthy. As a result,
+// handleInterrupt returns only lifecycle-key updates; the caller merges probe statuses into the same map.
 
-// parseInterruptAnnotation reports whether key requests its interrupt. The only valid values are
-// "true" and "false"; an absent annotation is "false". Any other value is an operator
-// misconfiguration and is returned as an error — never silently coerced in either direction.
-//
-// Deliberately not strconv.ParseBool: that accepts "True", "TRUE", "t", "1", "0" and friends, so
-// it would quietly accept eleven spellings of each value and reject the twelfth. The point of an
-// exact match is that the accepted set is the set that can be written down in documentation and
-// validated by an admission check — one spelling each, and everything else is visibly wrong at the
-// moment it is set rather than subtly wrong later. Do not "simplify" this to ParseBool.
+// parseInterruptAnnotation reports whether the given annotation requests an interrupt. The only
+// accepted values are "true" and "false"; an absent annotation is treated as "false". Any other
+// value is considered an operator configuration error and is returned as an error rather than
+// silently coerced.
 func parseInterruptAnnotation(annotations map[string]string, key string) (bool, error) {
 	v, ok := annotations[key]
 	if !ok {
@@ -61,20 +53,12 @@ func parseInterruptAnnotation(annotations map[string]string, key string) (bool, 
 	}
 }
 
-// readInterrupt interprets both interrupt annotations and reports what the agent should do.
-//
-// Precedence:
-//  1. a valid cancelled == "true" wins outright, even when the pause value is invalid — an
-//     operator stopping a runaway installer is not made to fix a typo on an unrelated annotation
-//     first;
-//  2. otherwise any invalid value is returned as an error, and the returned Interruption is
-//     meaningless to the caller;
-//  3. otherwise a valid paused == "true" holds the plan;
-//  4. otherwise the plan may run.
-//
-// An invalid cancel value does not let a valid pause take effect: pause is the weaker request, and
-// honoring it while the stronger one is unreadable would let the agent act on a guess about what
-// the operator meant.
+// readInterrupt evaluates both interrupt annotations and determines whether the plan should run.
+// The annotations are evaluated in this order:
+//  1. A valid cancelled == "true" takes precedence, even if the pause value is invalid.
+//  2. If cancellation is not active, any invalid annotation value is returned as an error.
+//  3. A valid paused == "true" pauses the plan.
+//  4. Otherwise, the plan may run.
 func readInterrupt(annotations map[string]string) (applyinator.Interruption, error) {
 	cancelled, cancelErr := parseInterruptAnnotation(annotations, PlanCancelledAnnotation)
 	paused, pauseErr := parseInterruptAnnotation(annotations, PlanPausedAnnotation)
@@ -83,8 +67,6 @@ func readInterrupt(annotations map[string]string) (applyinator.Interruption, err
 		return applyinator.InterruptionCanceled, nil
 	}
 	if cancelErr != nil || pauseErr != nil {
-		// Joined rather than returned one at a time so a doubly-mistyped Secret reports both
-		// mistakes in one message instead of one per reconcile.
 		return applyinator.InterruptionNone, errors.Join(cancelErr, pauseErr)
 	}
 	if paused {
@@ -93,18 +75,19 @@ func readInterrupt(annotations map[string]string) (applyinator.Interruption, err
 	return applyinator.InterruptionNone, nil
 }
 
-// interruptPollInterval is how often the interrupt watch re-reads the plan Secret while an apply
-// is in flight. A var rather than a const so tests can shorten it; see withInterruptPollInterval.
+// interruptPollInterval controls how often the interrupt watch re-reads the plan Secret during an
+// in-flight apply. It is a variable rather than a constant so tests can shorten the interval;
+// see withInterruptPollInterval.
 var interruptPollInterval = 2 * time.Second
 
-// startInterruptWatch polls the plan Secret while an apply is in flight and closes the returned
-// channel matching the first interrupt it observes. The controller cannot deliver the annotation
-// change itself: Applyinator.Apply runs synchronously inside the OnChange handler with
-// DefaultWorkers: 1, so while an apply is running the workqueue worker is busy. The informer's
-// indexer is updated by its own goroutine and is not blocked by that worker, so a cache read stays
-// fresh during an apply.
+// startInterruptWatch polls the plan Secret while an apply is in flight and closes the channel
+// corresponding to the first interrupt it observes. The controller cannot handle the annotation
+// change directly because Applyinator.Apply runs synchronously in the OnChange handler and
+// DefaultWorkers is 1, leaving the workqueue worker occupied for the duration of the apply.
+// The informer's indexer is updated independently of the worker, so reads from the cache continue
+// to reflect changes while an apply is running.
 //
-// The returned stop func must be deferred by the caller.
+// The caller must defer the returned stop function.
 func (w *watcher) startInterruptWatch(ctx context.Context, sc corecontrollers.SecretController) (cancelCh, pauseCh <-chan struct{}, stop func()) {
 	cancel := make(chan struct{})
 	pause := make(chan struct{})
@@ -123,9 +106,10 @@ func (w *watcher) startInterruptWatch(ctx context.Context, sc corecontrollers.Se
 	}
 }
 
-// pollInterrupts is startInterruptWatch's goroutine body. It is the only writer of cancel and
-// pause, so the "closed at most once" guards are plain bools rather than sync.Once.
-func (w *watcher) pollInterrupts(ctx context.Context, sc corecontrollers.SecretController, cancel, pause chan struct{}, stopCh, done chan struct{}) {
+// pollInterrupts is the goroutine body for startInterruptWatch. It is the sole writer to cancel
+// and pause, so plain bools are sufficient to ensure each channel is closed at most once; no
+// synchronization primitive such as sync.Once is needed.
+func (w *watcher) pollInterrupts(ctx context.Context, sc corecontrollers.SecretController, cancel, pause, stopCh, done chan struct{}) {
 	defer close(done)
 
 	ticker := time.NewTicker(interruptPollInterval)
@@ -149,14 +133,13 @@ func (w *watcher) pollInterrupts(ctx context.Context, sc corecontrollers.SecretC
 		// Delegated to readInterrupt so validity is decided in exactly one place.
 		interrupt, err := readInterrupt(annotations)
 		if err != nil {
-			// This is the one place this file's two paths diverge, and the divergence is
-			// deliberate. Interrupting an in-flight apply is destructive — for cancel,
-			// irreversibly so — and doing it on input the agent could not parse would be acting
-			// on a guess. The reconcile-entry path can afford to be strict because refusing to
-			// *start* costs nothing; the watch cannot. So an invalid value that appears mid-apply
-			// is reported and otherwise ignored until the operator corrects it, at which point
-			// the next poll sees a value it understands. The divergence is between "do not start"
-			// and "do not kill" — never between "hold" and "run".
+			// This is the deliberate divergence between the reconcile-entry and in-flight paths. Interrupting
+			// an in-flight apply is destructive — especially cancellation — and acting on an invalid value would
+			// mean guessing the operator's intent. At reconcile entry, the agent can safely reject invalid
+			// input because no work has started yet. During an apply, the watcher instead reports the invalid
+			// value and leaves the apply running until a subsequent poll sees a valid value.
+			//
+			// The distinction is between "do not start" and "do not kill", not between "hold" and "run".
 			if !errorLogged {
 				// Rate-limited to once per watch: the alternative is this line every 2s for the
 				// whole duration of the apply.
@@ -188,12 +171,14 @@ func (w *watcher) pollInterrupts(ctx context.Context, sc corecontrollers.SecretC
 	}
 }
 
-// readInterruptAnnotations reads the plan Secret's annotations, preferring the informer cache and
-// falling back to the live client. Both failing is reported as !ok and logged at debug: the caller
-// keeps polling rather than treating a transient read failure as an interrupt.
+// readInterruptAnnotations reads the plan Secret's annotations from the informer cache, falling
+// back to the live client when the cache lookup fails. If both reads fail, it returns !ok and logs
+// at debug level; the caller keeps polling rather than treating a transient read failure as an
+// interrupt.
 //
-// Cache objects are shared and must be treated as read-only. Only Annotations is read, the object
-// is never mutated, and neither it nor the returned map is retained past the poll that read it.
+// Informer cache objects are shared and must be treated as read-only. This function only reads
+// Annotations, does not mutate the object, and does not retain the object or annotation map beyond
+// the current poll.
 func (w *watcher) readInterruptAnnotations(sc corecontrollers.SecretController) (map[string]string, bool) {
 	secret, err := sc.Cache().Get(w.connInfo.Namespace, w.connInfo.SecretName)
 	if err == nil {
@@ -210,20 +195,19 @@ func (w *watcher) readInterruptAnnotations(sc corecontrollers.SecretController) 
 	return secret.Annotations, true
 }
 
-// handleInterrupt computes the Secret data writes for an interrupt observed at reconcile entry. It
-// returns an empty map when the interrupt is already recorded — see the write-once rule below.
-// The caller merges the returned map into the Secret.
+// handleInterrupt computes the Secret data updates for an interrupt detected at reconcile entry.
+// It returns an empty map when the interrupt has already been recorded; the caller merges any
+// returned updates into the Secret and emits the corresponding logs.
 //
-// The write-once rule: if the interrupt is already recorded, write nothing at all. Without it the
-// periodic re-enqueue re-enters this path every minute for the entire duration of the pause,
-// rewriting the Secret — and, worse, recomputing Completed from a reconcile where no apply is in
-// flight, which would silently reset a checkpoint that had just recorded real progress. Because
-// the checkpoint is durable, the rule also covers a restart: an agent that comes back up while the
-// annotation is still set finds the suspension already recorded and keeps its predecessor's
-// progress. It is also what makes ResumeState captured exactly once, at the moment the suspension
-// is first recorded.
+// The interrupt is recorded only once. Reconciliation runs periodically while a plan is paused,
+// so rewriting the Secret on every pass would repeatedly update it and could recompute Completed
+// when no apply is in flight, potentially overwriting a checkpoint that contains real progress.
+// Because the checkpoint is persisted, the same rule also preserves progress across agent restarts:
+// if the annotation remains set, the agent recognizes the existing suspension and leaves its
+// predecessor's checkpoint intact. ResumeState is therefore captured exactly once, when the
+// suspension is first recorded.
 //
-// The agent never edits the annotations; the orchestrator owns them.
+// The agent does not modify the interrupt annotations; they are owned by the orchestrator.
 func handleInterrupt(interrupt applyinator.Interruption, currentPlanState planapi.PlanState, data map[string][]byte,
 	checksum string, totalOneTimeInstructions int) map[string][]byte {
 	switch interrupt {
@@ -241,9 +225,9 @@ func handleInterrupt(interrupt applyinator.Interruption, currentPlanState planap
 	return map[string][]byte{}
 }
 
-// handleCancellation records a cancellation as a terminal plan-state plus a report of how far the
-// plan got. The report is not a suspension: it carries Paused: false and an empty ResumeState,
-// because there is nothing to resume into.
+// handleCancellation records cancellation as a terminal plan state together with a report of how
+// far the plan progressed. Unlike a suspension, cancellation does not preserve resumable state:
+// Paused is false and ResumeState is empty because there is nothing to resume.
 func handleCancellation(currentPlanState planapi.PlanState, data map[string][]byte, checksum string, totalOneTimeInstructions int) map[string][]byte {
 	if currentPlanState.IsTerminal() {
 		// This also implements cancel's write-once guard, which keys off plan-state rather than
@@ -270,8 +254,8 @@ func handleCancellation(currentPlanState planapi.PlanState, data map[string][]by
 	return updates
 }
 
-// handlePause records a suspension: a non-terminal plan-state plus the checkpoint the plan resumes
-// from once the annotation is removed.
+// handlePause records a suspension by preserving a non-terminal plan state and the checkpoint from
+// which the plan should resume once the pause annotation is removed.
 func handlePause(currentPlanState planapi.PlanState, data map[string][]byte, checksum string, totalOneTimeInstructions int) map[string][]byte {
 	existing := parsePlanProgress(data, checksum)
 	if existing.Paused {
@@ -286,12 +270,12 @@ func handlePause(currentPlanState planapi.PlanState, data map[string][]byte, che
 
 	resumeState := currentPlanState
 	if resumeState == PlanStatePaused {
-		// plan-state already says paused but no checkpoint vouches for it — a hand-edited Secret,
-		// or a checkpoint that was lost. "paused" is not a state to resume *into*: resolveResume
-		// would hand it straight back to decidePlanStateAction, which treats every state it does
-		// not know as terminal, and the plan would stall for good the moment it was unpaused.
-		// Leaving it empty lets resolveResume's in-progress default take over — re-executing from
-		// instruction 0 is always safe, stalling silently is not.
+		// The plan state says paused, but there is no checkpoint to support it - either the Secret was edited
+		// manually or the checkpoint was lost. A paused state without a checkpoint cannot safely be used as
+		// a resume point: resolveResume would pass it to decidePlanStateAction, which treats unknown states
+		// as terminal and could leave the plan permanently stalled after the pause is removed.
+		// Leave the resumeState empty so resolveResume falls back to its in-progress default and restarts
+		// from instruction 0. Re-executing from the beginning is safe; silently stalling is not.
 		resumeState = ""
 	}
 
@@ -310,26 +294,25 @@ func handlePause(currentPlanState planapi.PlanState, data map[string][]byte, che
 	return updates
 }
 
-// writeInterruptOutcome re-reads the Secret from the API server, verifies it still carries the plan
-// that was interrupted, merges updates into that fresh copy and Updates it, retrying the whole
-// read-modify-write on conflict. It skips the Update entirely when nothing changed, and it returns
-// errors to the caller rather than treating them as fatal.
+// writeInterruptOutcome persists the outcome of an interrupted apply using a fresh copy of the Secret.
+// It re-reads the Secret from the API server, verifies that it still represents the interrupted plan,
+// merges the updates, and retries the entire read-modify-write operation on conflict. If there are no
+// changes to write, it skips the Update. Errors are returned to the caller rather than treated as fatal.
 //
-// It exists instead of updateSecret because updateSecret's conflict retry only merges when
-// ck.Checksum == string(secret.Data[AppliedChecksumKey]) — it carries data over only if the
-// *already applied* checksum matches the plan now on the server. The interrupted path deliberately
-// does not write applied-checksum, so for the common case (a new Day 2 plan being canceled) that
-// comparison is against the previous plan's checksum and fails, updateSecret returns the error, and
-// reconcileSecret calls logrus.Fatalf.
+// This uses a separate write path from updateSecret because updateSecret's conflict handling only
+// preserves data when ck.Checksum matches the AppliedChecksumKey currently stored on the server. The
+// interrupted path intentionally does not write the applied checksum, so a newly canceled plan can
+// fail that check against the previous plan's checksum. updateSecret would then return an error that
+// reconcileSecret treats as fatal.
 //
-// And the conflict is not a rare race, it is the normal path: the operator's annotation write bumps
-// the Secret's resourceVersion while the agent holds a copy read before the apply started, so the
-// outcome Update is guaranteed to 409. Under updateSecret's behaviour cancel would self-heal by
-// crashing and pause would not — the checkpoint and the accumulated applied-output would be lost,
-// so unpause would re-run from instruction 0, silently defeating the feature.
+// A conflict is expected here rather than exceptional: the operator's annotation update changes the
+// Secret's resourceVersion while the agent may still hold the copy read before the apply began. The
+// outcome write must therefore retry from a fresh Secret. Using updateSecret could cause cancellation
+// to crash while pause might lose the checkpoint and applied output, causing an unpause to restart
+// from instruction 0 and defeating resumability.
 //
-// An empty updates map is legal and common (it is what the write-once guard produces); it becomes a
-// no-op with no Update call. The Get still happens, which is what makes the staleness check honest.
+// An empty updates map is valid and commonly produced by the write-once guard. In that case the
+// Secret is still read to verify freshness, but no Update is issued.
 func (w *watcher) writeInterruptOutcome(sc corecontrollers.SecretController, checksum string, updates map[string][]byte) (*corev1.Secret, error) {
 	var result *corev1.Secret
 	// The retry wraps the whole read-modify-write, not just the Update: a conflict means the copy
@@ -347,7 +330,6 @@ func (w *watcher) writeInterruptOutcome(sc corecontrollers.SecretController, che
 			return nil
 		}
 
-		// The live client may hand back a shared object, so mutate a copy.
 		updated := latest.DeepCopy()
 		if len(updates) > 0 && updated.Data == nil {
 			// Defensive: secretCarriesPlan means Data is non-nil here today. Only initialise when
@@ -376,8 +358,6 @@ func (w *watcher) writeInterruptOutcome(sc corecontrollers.SecretController, che
 		logrus.Infof("[k8splan] recorded the interrupt outcome on plan secret %s/%s", w.connInfo.Namespace, w.connInfo.SecretName)
 		return nil
 	})
-	// No logrus.Fatalf on this path, ever: reconcileSecret propagates the error and the workqueue
-	// retries under its configured exponential rate limiter.
 	return result, err
 }
 
