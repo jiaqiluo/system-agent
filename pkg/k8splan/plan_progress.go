@@ -82,9 +82,27 @@ func resolveResume(state planapi.PlanState, data map[string][]byte, checksum str
 		// plan-state says paused but no suspended checkpoint vouches for any progress: a
 		// hand-edited Secret, or a cancel report on a plan someone then paused. Resume the state,
 		// not the position.
-		return orDefault(p.ResumeState, planapi.PlanStateInProgress), 0
+		return orDefault(sanitizeResumeState(p.ResumeState), planapi.PlanStateInProgress), 0
 	}
-	return orDefault(p.ResumeState, planapi.PlanStateInProgress), p.Completed
+	return orDefault(sanitizeResumeState(p.ResumeState), planapi.PlanStateInProgress), p.Completed
+}
+
+// sanitizeResumeState rejects a stored ResumeState of PlanStatePaused, treating it as unset so
+// orDefault's in-progress fallback takes over.
+//
+// Resuming *into* paused is a silent permanent stall: decidePlanStateAction routes every state it
+// does not know to its terminal default branch, so the plan would never run again and never leave
+// paused, with no annotation left for an operator to remove. handleInterrupt already refuses to
+// write such a record; this is the reading half, for a hand-edited Secret or one written by a
+// build that predates that guard. Re-executing from instruction 0 is always safe; stalling
+// silently is not.
+func sanitizeResumeState(state planapi.PlanState) planapi.PlanState {
+	if state != PlanStatePaused {
+		return state
+	}
+	logrus.Warnf("[k8splan] ignoring a stored resume state of %q, which would stall the plan permanently; resuming into %q instead",
+		PlanStatePaused, planapi.PlanStateInProgress)
+	return ""
 }
 
 // orDefault returns v unless it is the zero value, in which case it returns def.

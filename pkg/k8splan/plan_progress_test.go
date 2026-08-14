@@ -243,6 +243,24 @@ func TestResolveResume(t *testing.T) {
 			wantResumeFrom: 0,
 		},
 		{
+			// Resuming into "paused" is a silent permanent stall: decidePlanStateAction treats
+			// every state it does not know as terminal, so the plan would never run again and
+			// never leave paused, with no annotation left for an operator to remove. The agent
+			// cannot write such a record; a hand-edited Secret can.
+			name:           "a hand-edited resume state of paused is ignored rather than stalling the plan forever",
+			state:          PlanStatePaused,
+			progress:       &planProgress{Checksum: progressChecksum, Completed: 2, Total: 5, ResumeState: PlanStatePaused, Paused: true},
+			wantState:      planapi.PlanStateInProgress,
+			wantResumeFrom: 2,
+		},
+		{
+			name:           "a hand-edited resume state of paused is ignored without a suspended checkpoint too",
+			state:          PlanStatePaused,
+			progress:       &planProgress{Checksum: progressChecksum, Completed: 2, Total: 5, ResumeState: PlanStatePaused},
+			wantState:      planapi.PlanStateInProgress,
+			wantResumeFrom: 0,
+		},
+		{
 			name:           "succeeded passes through",
 			state:          planapi.PlanStateSucceeded,
 			wantState:      planapi.PlanStateSucceeded,

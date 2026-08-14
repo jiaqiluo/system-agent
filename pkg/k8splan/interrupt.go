@@ -212,7 +212,7 @@ func (w *watcher) readInterruptAnnotations(sc corecontrollers.SecretController) 
 
 // handleInterrupt computes the Secret data writes for an interrupt observed at reconcile entry. It
 // returns an empty map when the interrupt is already recorded — see the write-once rule below.
-// The caller merges the returned map into the Secret and emits the returned logs.
+// The caller merges the returned map into the Secret.
 //
 // The write-once rule: if the interrupt is already recorded, write nothing at all. Without it the
 // periodic re-enqueue re-enters this path every minute for the entire duration of the pause,
@@ -224,9 +224,8 @@ func (w *watcher) readInterruptAnnotations(sc corecontrollers.SecretController) 
 // is first recorded.
 //
 // The agent never edits the annotations; the orchestrator owns them.
-func handleInterrupt(interrupt applyinator.Interruption, currentPlanState planapi.PlanState, data map[string][]byte, checksum string,
-	totalOneTimeInstructions int,
-) (map[string][]byte, []decisionLog) {
+func handleInterrupt(interrupt applyinator.Interruption, currentPlanState planapi.PlanState, data map[string][]byte,
+	checksum string, totalOneTimeInstructions int) map[string][]byte {
 	switch interrupt {
 	case applyinator.InterruptionCanceled:
 		return handleCancellation(currentPlanState, data, checksum, totalOneTimeInstructions)
@@ -235,23 +234,24 @@ func handleInterrupt(interrupt applyinator.Interruption, currentPlanState planap
 	case applyinator.InterruptionNone:
 		// Unreachable by contract: the caller only reaches this function for a real interrupt.
 		// Writing nothing is the safe response to an input that was not supposed to arrive.
-		return map[string][]byte{}, []decisionLog{debugDecision("handleInterrupt called with no interruption; nothing to record")}
+		logrus.Debugf("[k8splan] handleInterrupt called with no interruption; nothing to record")
+		return map[string][]byte{}
 	}
-	return map[string][]byte{}, []decisionLog{debugDecision("handleInterrupt called with unknown interruption %q; nothing to record", interrupt)}
+	logrus.Debugf("[k8splan] handleInterrupt called with unknown interruption %q; nothing to record", interrupt)
+	return map[string][]byte{}
 }
 
 // handleCancellation records a cancellation as a terminal plan-state plus a report of how far the
 // plan got. The report is not a suspension: it carries Paused: false and an empty ResumeState,
 // because there is nothing to resume into.
-func handleCancellation(currentPlanState planapi.PlanState, data map[string][]byte, checksum string,
-	totalOneTimeInstructions int,
-) (map[string][]byte, []decisionLog) {
+func handleCancellation(currentPlanState planapi.PlanState, data map[string][]byte, checksum string, totalOneTimeInstructions int) map[string][]byte {
 	if currentPlanState.IsTerminal() {
 		// This also implements cancel's write-once guard, which keys off plan-state rather than
 		// the checkpoint: PlanStateCancelled is terminal, so an already-recorded cancellation
 		// lands here and rewrites nothing. Cancel keys off plan-state — unlike pause, which keys
 		// off the checkpoint — because it writes no resumable checkpoint to key off.
-		return map[string][]byte{}, []decisionLog{debugDecision("plan-state is %q (terminal); not recording the cancellation", currentPlanState)}
+		logrus.Debugf("[k8splan] plan-state is %q (terminal); not recording the cancellation", currentPlanState)
+		return map[string][]byte{}
 	}
 
 	completed := parsePlanProgress(data, checksum).Completed
@@ -265,25 +265,23 @@ func handleCancellation(currentPlanState planapi.PlanState, data map[string][]by
 			// only a suspended checkpoint ever grants a resume.
 		}),
 	}
-	logs := []decisionLog{infoDecision("%s is set; recording plan-state %q after %d of %d one-time instructions",
-		PlanCancelledAnnotation, planapi.PlanStateCancelled, completed, totalOneTimeInstructions)}
-	return updates, logs
+	logrus.Infof("[k8splan] %s is set; recording plan-state %q after %d of %d one-time instructions",
+		PlanCancelledAnnotation, planapi.PlanStateCancelled, completed, totalOneTimeInstructions)
+	return updates
 }
 
 // handlePause records a suspension: a non-terminal plan-state plus the checkpoint the plan resumes
 // from once the annotation is removed.
-func handlePause(currentPlanState planapi.PlanState, data map[string][]byte, checksum string,
-	totalOneTimeInstructions int,
-) (map[string][]byte, []decisionLog) {
+func handlePause(currentPlanState planapi.PlanState, data map[string][]byte, checksum string, totalOneTimeInstructions int) map[string][]byte {
 	existing := parsePlanProgress(data, checksum)
 	if existing.Paused {
 		// Pause's write-once guard keys off the checkpoint, not off plan-state. The checkpoint is
 		// the thing that must not be recomputed, so it is the thing to test; and it is the more
 		// precise signal, because plan-state == paused with no checkpoint beneath it is a state
 		// this guard must NOT suppress — there is a suspension to record for the first time.
-		logs := []decisionLog{debugDecision("suspension already recorded for checksum %s at %d of %d one-time instructions; not rewriting it",
-			checksum, existing.Completed, existing.Total)}
-		return map[string][]byte{}, logs
+		logrus.Debugf("[k8splan] suspension already recorded for checksum %s at %d of %d one-time instructions; not rewriting it",
+			checksum, existing.Completed, existing.Total)
+		return map[string][]byte{}
 	}
 
 	resumeState := currentPlanState
@@ -307,9 +305,9 @@ func handlePause(currentPlanState planapi.PlanState, data map[string][]byte, che
 			Paused:      true,
 		}),
 	}
-	logs := []decisionLog{infoDecision("%s is set; holding the plan at %d of %d one-time instructions, to resume into plan-state %q",
-		PlanPausedAnnotation, existing.Completed, totalOneTimeInstructions, resumeState)}
-	return updates, logs
+	logrus.Infof("[k8splan] %s is set; holding the plan at %d of %d one-time instructions, to resume into plan-state %q",
+		PlanPausedAnnotation, existing.Completed, totalOneTimeInstructions, resumeState)
+	return updates
 }
 
 // writeInterruptOutcome re-reads the Secret from the API server, verifies it still carries the plan
@@ -320,7 +318,7 @@ func handlePause(currentPlanState planapi.PlanState, data map[string][]byte, che
 // It exists instead of updateSecret because updateSecret's conflict retry only merges when
 // ck.Checksum == string(secret.Data[AppliedChecksumKey]) — it carries data over only if the
 // *already applied* checksum matches the plan now on the server. The interrupted path deliberately
-// does not write applied-checksum, so for the common case (a new Day 2 plan being cancelled) that
+// does not write applied-checksum, so for the common case (a new Day 2 plan being canceled) that
 // comparison is against the previous plan's checksum and fails, updateSecret returns the error, and
 // reconcileSecret calls logrus.Fatalf.
 //

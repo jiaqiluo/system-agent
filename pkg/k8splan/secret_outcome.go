@@ -26,6 +26,12 @@ type applyOutcomeInput struct {
 func buildSecretDataUpdates(in applyOutcomeInput) map[string][]byte {
 	updates := map[string][]byte{
 		AppliedPeriodicOutputKey: in.PeriodicOutput,
+		// Both outcomes below are terminal for this apply, so the resume checkpoint has served
+		// its purpose and must not leak into a later run. Cleared as an empty value rather than
+		// a delete — see the comment on secretConflictMergeKeys: the conflict merge loop only
+		// carries over keys present in the in-hand copy, so a delete would be silently lost on
+		// a retry.
+		PlanProgressKey: {},
 	}
 
 	failed := (in.NeedsApplied && !in.OneTimeApplySucceeded) || (!in.NeedsApplied && in.WasFailedPlan)

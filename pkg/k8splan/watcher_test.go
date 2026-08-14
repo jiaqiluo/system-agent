@@ -390,6 +390,55 @@ func TestUpdateSecretConflictMergeSkipsKeysAbsentFromOurCopy(t *testing.T) {
 	}
 }
 
+// TestUpdateSecretConflictMergeCarriesAnEmptyClear pins the empty-value path through the conflict
+// merge. Every clear in secret_outcome.go is written as []byte{} rather than a delete, precisely
+// because the merge loop only carries over keys present in the in-hand copy: a delete would leave
+// the server's stale value in place and the clear would be silently lost on a retry.
+//
+// This passes today. Its job is to stop a future tidy-up of the loop's presence check from
+// `if v, ok := ...` to `if len(v) > 0` from re-breaking every one of those clears at once — a
+// change that looks like a simplification and would leave a stale resume checkpoint on the wire.
+func TestUpdateSecretConflictMergeCarriesAnEmptyClear(t *testing.T) {
+	t.Parallel()
+
+	ourPlan, ourChecksum := marshalPlan(t, planapi.Plan{})
+
+	// Our in-hand copy carries the clear buildSecretDataUpdates produces on a terminal outcome.
+	ours := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Namespace: testNamespace, Name: testSecret, ResourceVersion: "1"},
+		Data: map[string][]byte{
+			PlanKey:            ourPlan,
+			AppliedChecksumKey: []byte(ourChecksum),
+			PlanProgressKey:    {},
+		},
+	}
+	// The server still holds the checkpoint written before the plan finished.
+	latest := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Namespace: testNamespace, Name: testSecret, ResourceVersion: "2"},
+		Data: map[string][]byte{
+			PlanKey:         ourPlan,
+			PlanProgressKey: marshalPlanProgress(planProgress{Checksum: ourChecksum, Completed: 1, Total: 3, Paused: true}),
+		},
+	}
+
+	updates, err := conflictedUpdate(t, ours, latest)
+	if err != nil {
+		t.Fatalf("expected updateSecret to succeed after retry, got %v", err)
+	}
+	if len(updates) != 2 {
+		t.Fatalf("expected 2 Update calls, got %d", len(updates))
+	}
+
+	retried := updates[1]
+	value, ok := retried.Data[PlanProgressKey]
+	if !ok {
+		t.Fatalf("expected merge key %q to still be present on the retried Secret", PlanProgressKey)
+	}
+	if len(value) != 0 {
+		t.Errorf("expected our empty-value clear of %q to survive the conflict retry, got the stale value %q", PlanProgressKey, value)
+	}
+}
+
 // TestSecretConflictMergeKeyCount pins the merge key set: the pre-refactor updateSecret's 11 keys
 // plus the resume checkpoint, whose clear on a terminal outcome must survive a conflict retry.
 func TestSecretConflictMergeKeyCount(t *testing.T) {
