@@ -3,7 +3,6 @@ package k8splan
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
@@ -229,14 +228,21 @@ func suppressionMatrix() []suppressionRow {
 		},
 		{
 			// Cancel's write-once guard, which keys off the terminal plan-state rather than off
-			// the checkpoint: it writes no resumable checkpoint to key off. Not reachable from any
-			// paused-annotation row, so it carries its own annotation.
-			name:        "cancelled and already cancelled: cancel's write-once guard keys off the terminal plan-state",
+			// the checkpoint: cancel writes no resumable checkpoint to key off.
+			//
+			// A SUCCEEDED plan the operator then cancels, deliberately, rather than an
+			// already-cancelled one. On an already-cancelled plan the write the guard suppresses
+			// would be byte-identical to what is already stored, so writeInterruptOutcome's
+			// DeepEqual would skip the Update whether the guard fired or not and the row would be
+			// blind to it. Here the suppressed write would move plan-state from succeeded to
+			// cancelled, so the guard's absence is visible. Not reachable from any
+			// paused-annotation row, so the row carries its own annotation.
+			name:        "succeeded then cancelled: cancel's write-once guard keys off the terminal plan-state",
 			annotation:  PlanCancelledAnnotation,
-			planState:   planapi.PlanStateCancelled,
+			planState:   planapi.PlanStateSucceeded,
 			checkpoint:  &planProgress{Completed: 2, Total: 3},
 			wantUpdates: 0,
-			wantState:   planapi.PlanStateCancelled,
+			wantState:   planapi.PlanStateSucceeded,
 		},
 	}
 }
@@ -523,25 +529,10 @@ func TestRestartThenUnpauseResumesAtTheCheckpoint(t *testing.T) {
 				}),
 			})
 
-			type observedUpdate struct {
-				planState   string
-				paused      bool
-				applyHadRun bool
-			}
-			var observed []observedUpdate
 			rec := newInterruptRecorder(secret)
-			sc := newInterruptTestControllerWithHook(t, rec, func(s *corev1.Secret) {
-				_, statErr := os.Stat(sentinels[2])
-				// Decoded leniently rather than through checkpointIn: the terminal outcome write
-				// clears this key to an empty value, which is absence and not corruption.
-				var progress planProgress
-				_ = json.Unmarshal(s.Data[PlanProgressKey], &progress)
-				observed = append(observed, observedUpdate{
-					planState:   string(s.Data[planapi.PlanStateKey]),
-					paused:      progress.Paused,
-					applyHadRun: statErr == nil,
-				})
-			})
+			// The apply marker is instruction 2's sentinel: it is the first thing the resumed
+			// apply does, so a write that lands before it genuinely predates the apply.
+			sc, observations := observeUpdateOrdering(t, rec, sentinels[2])
 
 			w := newTestWatcher(t, false, "") // a fresh agent: the checkpoint is the only memory it has
 			result, err := w.reconcileSecret(context.Background(), sc, secret, 30*time.Second)
@@ -549,22 +540,7 @@ func TestRestartThenUnpauseResumesAtTheCheckpoint(t *testing.T) {
 				t.Fatalf("reconcileSecret returned error: %v", err)
 			}
 
-			if len(observed) < 1 {
-				t.Fatal("expected at least the resume commit to be written")
-			}
-			first := observed[0]
-			if first.planState != string(planapi.PlanStateInProgress) {
-				t.Errorf("expected the resume commit to land FIRST with the resolved plan-state %q, got %q",
-					planapi.PlanStateInProgress, first.planState)
-			}
-			if first.paused {
-				t.Error("expected the resume commit to clear the checkpoint's Paused flag; a lingering flag would make the " +
-					"next pause look already-recorded and keep a stale Completed")
-			}
-			if first.applyHadRun {
-				t.Error("expected the resume commit to reach the API server BEFORE Apply ran; a plan that is executing " +
-					"must not report paused")
-			}
+			assertResumeCommitLandedFirst(t, observations(), planapi.PlanStateInProgress)
 
 			// ResumeFromOneTimeInstruction is not directly observable — this is what 2 looks like.
 			assertPathAbsent(t, sentinels[0], "instruction 0 completed in a previous agent lifetime and must never be re-run")
@@ -600,24 +576,41 @@ func TestRestartThenUnpauseResumesAtTheCheckpoint(t *testing.T) {
 	}
 }
 
-// TestRestartMidExecutionStillReExecutesFromZero pins the other half of the resume rule: the
-// crash-recovery contract is UNCHANGED for plans that were running rather than held. Only a
-// suspended checkpoint grants a resume, so neither a missing checkpoint nor a Paused: false one —
-// the shape a resume commit and a cancel report both leave behind — may position an apply.
-func TestRestartMidExecutionStillReExecutesFromZero(t *testing.T) {
+// TestOnlyASuspendedCheckpointGrantsAResume pins the sole gate on a checkpoint's Completed being
+// honored: planProgress.Paused. A Paused: false record is a REPORT — of how far a cancelled plan
+// got, or of where a resume commit released a plan — and a report must never position an apply.
+//
+// The two rows are the two distinct returns resolveResume can take to reach that answer, and each
+// is reachable only from its own plan-state:
+//
+//   - plan-state in-progress leaves at the "not paused either way" return (plan_progress.go:78);
+//   - plan-state paused falls past it into the !p.Paused branch (plan_progress.go:81), which the
+//     in-progress row cannot enter at all.
+//
+// The third shape — in-progress with no checkpoint whatsoever — is the plain crash-recovery
+// contract and is already pinned by TestReconcileSecretInProgressOnStartupReExecutes; it is
+// deliberately not repeated here.
+func TestOnlyASuspendedCheckpointGrantsAResume(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("requires a POSIX shell")
 	}
 	t.Parallel()
 
 	tests := []struct {
-		name       string
-		checkpoint *planProgress
+		name      string
+		planState planapi.PlanState
 	}{
-		{name: "no checkpoint at all", checkpoint: nil},
 		{
-			name:       "a checkpoint left at Paused: false by a resume commit or a cancel report",
-			checkpoint: &planProgress{Completed: 2, Total: 3},
+			// A checkpoint a resume commit left behind. The crash-recovery contract is UNCHANGED
+			// for a plan that was running rather than held: it re-executes from instruction 0.
+			name:      "in-progress under a released checkpoint: crash recovery re-executes from the beginning",
+			planState: planapi.PlanStateInProgress,
+		},
+		{
+			// A cancel report on a plan someone then paused and unpaused. The report records how
+			// far the cancelled plan got; mistaking it for a resume point would skip real work.
+			name:      "paused under a cancel report: a report is never mistaken for a resume point",
+			planState: PlanStatePaused,
 		},
 	}
 
@@ -626,13 +619,11 @@ func TestRestartMidExecutionStillReExecutesFromZero(t *testing.T) {
 			t.Parallel()
 
 			f := newSuppressionFixture(t)
-			data := map[string][]byte{planapi.PlanStateKey: []byte(planapi.PlanStateInProgress)}
-			if tt.checkpoint != nil {
-				checkpoint := *tt.checkpoint
-				checkpoint.Checksum = f.checksum
-				data[PlanProgressKey] = marshalPlanProgress(checkpoint)
-			}
-			secret := newInterruptTestSecret(f.planBytes, nil, data)
+			secret := newInterruptTestSecret(f.planBytes, nil, map[string][]byte{
+				planapi.PlanStateKey: []byte(tt.planState),
+				// Paused: false — deliberately claiming progress that must NOT be honored.
+				PlanProgressKey: marshalPlanProgress(planProgress{Checksum: f.checksum, Completed: 2, Total: 3}),
+			})
 			rec := newInterruptRecorder(secret)
 			sc := newInterruptTestController(t, rec)
 
@@ -642,6 +633,7 @@ func TestRestartMidExecutionStillReExecutesFromZero(t *testing.T) {
 				t.Fatalf("reconcileSecret returned error: %v", err)
 			}
 
+			// Every instruction, including the two the report claims are complete.
 			f.assertApplyRanFully(t)
 			if got := planapi.PlanState(result.Data[planapi.PlanStateKey]); got != planapi.PlanStateSucceeded {
 				t.Errorf("expected the re-executed plan to finish as %q, got %q", planapi.PlanStateSucceeded, got)
@@ -1044,7 +1036,10 @@ func TestHandEditedResumeStateMarksThePlanAppliedWithoutRunningIt(t *testing.T) 
 	f := newSuppressionFixture(t)
 	secret := newInterruptTestSecret(f.planBytes, nil, map[string][]byte{
 		planapi.PlanStateKey: []byte(planapi.PlanStatePending),
-		// Hand-edited: a suspended checkpoint claiming the plan had already succeeded.
+		// The checkpoint a pause of an already-succeeded plan leaves behind — byte-identical to
+		// what Part 1's "succeeded with no checkpoint" row asserts handlePause writes. Nothing is
+		// forged here; what has been mutilated is plan-state, moved out from under the checkpoint
+		// to a non-terminal value that the agent itself would never pair with this record.
 		PlanProgressKey: marshalPlanProgress(planProgress{
 			Checksum: f.checksum, Completed: 0, Total: 3, ResumeState: planapi.PlanStateSucceeded, Paused: true,
 		}),

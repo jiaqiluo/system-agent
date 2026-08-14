@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -710,12 +711,23 @@ func (r *interruptRecorder) get() *corev1.Secret {
 	return r.server.DeepCopy()
 }
 
+// update records the write and stores it, bumping the resourceVersion exactly as the API server
+// would.
+//
+// The bump is not cosmetic and must not be dropped: without it a Secret that WAS written comes
+// back at the resourceVersion it went in with, so every "the returned resourceVersion is
+// byte-identical to the input's" assertion in this package passes whether or not a write happened
+// — which is precisely the inference those assertions exist to replace. The recorded write keeps
+// the resourceVersion the agent submitted, so a test can still assert which object a write was
+// built on.
 func (r *interruptRecorder) update(s *corev1.Secret) *corev1.Secret {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.updates = append(r.updates, s.DeepCopy())
-	r.server = s.DeepCopy()
-	return s
+	stored := s.DeepCopy()
+	stored.ResourceVersion = strconv.Itoa(toInt(s.ResourceVersion) + 1)
+	r.server = stored
+	return stored.DeepCopy()
 }
 
 func (r *interruptRecorder) enqueue(d time.Duration) {
@@ -793,6 +805,72 @@ func newInterruptTestSecret(planBytes []byte, annotations map[string]string, dat
 			Annotations:     annotations,
 		},
 		Data: full,
+	}
+}
+
+// observedUpdate is one Update call as seen by observeUpdateOrdering.
+type observedUpdate struct {
+	planState   string
+	paused      bool
+	applyHadRun bool
+}
+
+// observeUpdateOrdering wires a SecretController backed by rec that records, for every Update, the
+// plan-state and checkpoint the write carried and whether applyMarker existed at the moment it
+// reached the API server.
+//
+// That last field is the whole point: the ordering rules in this package — the pending ->
+// in-progress pre-commit, and the resume commit — are about a write landing before Apply RUNS, not
+// before some other write. Observing an actual side effect of the apply is the only way to assert
+// that; call order alone cannot.
+//
+// The returned func reports the observations so far, in order.
+func observeUpdateOrdering(t *testing.T, rec *interruptRecorder, applyMarker string,
+) (*fake.MockControllerInterface[*corev1.Secret, *corev1.SecretList], func() []observedUpdate) {
+	t.Helper()
+
+	var mu sync.Mutex
+	var observed []observedUpdate
+	sc := newInterruptTestControllerWithHook(t, rec, func(s *corev1.Secret) {
+		_, statErr := os.Stat(applyMarker)
+		// Decoded leniently rather than through checkpointIn: a terminal outcome write clears
+		// this key to an empty value, which is absence and not corruption.
+		var progress planProgress
+		_ = json.Unmarshal(s.Data[PlanProgressKey], &progress)
+
+		mu.Lock()
+		defer mu.Unlock()
+		observed = append(observed, observedUpdate{
+			planState:   string(s.Data[planapi.PlanStateKey]),
+			paused:      progress.Paused,
+			applyHadRun: statErr == nil,
+		})
+	})
+	return sc, func() []observedUpdate {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]observedUpdate(nil), observed...)
+	}
+}
+
+// assertResumeCommitLandedFirst asserts the ordering the resume path exists to guarantee: the write
+// that releases a suspension is the FIRST write of the reconcile and reaches the API server BEFORE
+// Apply runs.
+func assertResumeCommitLandedFirst(t *testing.T, observed []observedUpdate, wantState planapi.PlanState) {
+	t.Helper()
+
+	if len(observed) < 1 {
+		t.Fatal("expected at least the resume commit to be written")
+	}
+	first := observed[0]
+	if first.planState != string(wantState) {
+		t.Errorf("expected the resume commit to write the resolved plan-state %q, got %q", wantState, first.planState)
+	}
+	if first.paused {
+		t.Error("expected the resume commit to clear the checkpoint's Paused flag; a lingering flag would make a second pause a no-op")
+	}
+	if first.applyHadRun {
+		t.Error("expected the resume commit to reach the API server BEFORE Apply ran; a plan that is executing must not report paused")
 	}
 }
 
@@ -1313,23 +1391,8 @@ func TestReconcileSecretResumeCommitLandsBeforeTheApply(t *testing.T) {
 		}),
 	})
 
-	type observedUpdate struct {
-		planState   string
-		paused      bool
-		applyHadRun bool
-	}
-	var observed []observedUpdate
 	rec := newInterruptRecorder(secret)
-	sc := newInterruptTestControllerWithHook(t, rec, func(s *corev1.Secret) {
-		_, statErr := os.Stat(marker)
-		var p planProgress
-		_ = json.Unmarshal(s.Data[PlanProgressKey], &p)
-		observed = append(observed, observedUpdate{
-			planState:   string(s.Data[planapi.PlanStateKey]),
-			paused:      p.Paused,
-			applyHadRun: statErr == nil,
-		})
-	})
+	sc, observations := observeUpdateOrdering(t, rec, marker)
 
 	w := newTestWatcher(t, true, "42")
 	result, err := w.reconcileSecret(context.Background(), sc, secret, 30*time.Second)
@@ -1337,19 +1400,7 @@ func TestReconcileSecretResumeCommitLandsBeforeTheApply(t *testing.T) {
 		t.Fatalf("reconcileSecret returned error: %v", err)
 	}
 
-	if len(observed) < 1 {
-		t.Fatal("expected at least the resume commit to be written")
-	}
-	first := observed[0]
-	if first.planState != string(planapi.PlanStateInProgress) {
-		t.Errorf("expected the resume commit to write the resolved plan-state %q, got %q", planapi.PlanStateInProgress, first.planState)
-	}
-	if first.paused {
-		t.Error("expected the resume commit to clear the checkpoint's Paused flag; a lingering flag would make a second pause a no-op")
-	}
-	if first.applyHadRun {
-		t.Error("expected the resume commit to reach the API server BEFORE Apply ran; a plan that is executing must not report paused")
-	}
+	assertResumeCommitLandedFirst(t, observations(), planapi.PlanStateInProgress)
 	if _, statErr := os.Stat(marker); statErr != nil {
 		t.Errorf("expected the resumed plan to actually be applied, marker missing: %v", statErr)
 	}
@@ -1612,5 +1663,45 @@ func TestReconcileSecretChecksumFlowMakesNoResumeCommit(t *testing.T) {
 	}
 	if string(result.Data[AppliedChecksumKey]) != checksum {
 		t.Errorf("expected applied-checksum %q, got %q", checksum, result.Data[AppliedChecksumKey])
+	}
+}
+
+// TestClampResumeFrom pins the boundary guard on an operator-controllable input path.
+//
+// The resume checkpoint lives in the plan Secret, and resolveResume hands its stored Completed
+// back verbatim — so a hand-edited or truncated plan-progress can deliver 999, or a negative, to
+// the index an apply starts at. pkg/applyinator clamps internally too; this is defence in depth at
+// the boundary where the operator-controllable value enters, and defence in depth is exactly the
+// kind of code that rots silently because nothing downstream fails when it stops working.
+func TestClampResumeFrom(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		resumeFrom int
+		total      int
+		want       int
+	}{
+		{name: "negative resumes from the first instruction", resumeFrom: -1, total: 3, want: 0},
+		{name: "a large negative resumes from the first instruction", resumeFrom: -999, total: 3, want: 0},
+		{name: "zero is unchanged", resumeFrom: 0, total: 3, want: 0},
+		{name: "in range is unchanged", resumeFrom: 2, total: 3, want: 2},
+		// Not off-by-one: Completed == len means every instruction ran, which is a legitimate
+		// checkpoint and must survive unclamped.
+		{name: "exactly the instruction count is unchanged", resumeFrom: 3, total: 3, want: 3},
+		{name: "past the end clamps to the instruction count", resumeFrom: 4, total: 3, want: 3},
+		{name: "far past the end clamps to the instruction count", resumeFrom: 999, total: 3, want: 3},
+		{name: "a plan with no one-time instructions clamps everything to zero", resumeFrom: 999, total: 0, want: 0},
+		{name: "a plan with no one-time instructions leaves zero alone", resumeFrom: 0, total: 0, want: 0},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := clampResumeFrom(tt.resumeFrom, tt.total); got != tt.want {
+				t.Errorf("clampResumeFrom(%d, %d) = %d, want %d", tt.resumeFrom, tt.total, got, tt.want)
+			}
+		})
 	}
 }
