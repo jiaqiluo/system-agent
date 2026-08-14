@@ -176,6 +176,12 @@ func (a *Applyinator) Apply(ctx context.Context, input ApplyInput) (ApplyOutput,
 	// already cancelled must not queue behind an in-flight apply on the mutex, and must not sit in
 	// checkInterlock's restart-pending wait for up to restartPendingTimeout only to return an error instead of
 	// a clean InterruptionCanceled.
+	//
+	// It is a contract on ApplyInput, not a path production exercises today: pkg/k8splan's only caller hands
+	// over channels its interrupt watch has just created and cannot have closed yet, and pkg/localplan passes
+	// nil. Its coverage is the unit tests, so do not read production reachability into it — and do not delete
+	// it on the strength of that, either. It is what makes "an already-interrupted ApplyInput is a reported
+	// outcome, not a wait" true for any caller.
 	if interruption := checkInterruption(input.Cancel, input.Pause); interruption != InterruptionNone {
 		logrus.Infof("[applyinator] not applying plan with checksum %s: %s before the apply started", input.CalculatedPlan.Checksum, interruption)
 		output.Interruption = interruption
