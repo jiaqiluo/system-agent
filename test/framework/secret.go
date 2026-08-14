@@ -25,6 +25,7 @@ import (
 	"github.com/rancher/system-agent/pkg/k8splan"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -130,6 +131,18 @@ func GetProbeStatuses(ctx context.Context, cl client.Client, namespace, name str
 
 // CreatePlanSecretWithData creates a Kubernetes Secret containing a plan plus additional data fields.
 func CreatePlanSecretWithData(ctx context.Context, cl client.Client, namespace, name string, plan []byte, extraData map[string][]byte) error {
+	return CreatePlanSecretWithAnnotations(ctx, cl, namespace, name, plan, extraData, nil)
+}
+
+// CreatePlanSecretWithAnnotations creates a plan Secret that carries annotations from the moment
+// it exists.
+//
+// The interrupt annotations have to be in place before the agent's first reconcile for any spec
+// that asserts a plan never ran at all: setting them after the Create races the apply, and for a
+// plan whose instruction finishes in milliseconds that is a race the spec loses.
+func CreatePlanSecretWithAnnotations(ctx context.Context, cl client.Client, namespace, name string, plan []byte,
+	extraData map[string][]byte, annotations map[string]string,
+) error {
 	data := map[string][]byte{
 		k8splan.PlanKey: plan,
 	}
@@ -138,12 +151,78 @@ func CreatePlanSecretWithData(ctx context.Context, cl client.Client, namespace, 
 	}
 	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: namespace,
+			Name:        name,
+			Namespace:   namespace,
+			Annotations: annotations,
 		},
 		Data: data,
 	}
 	return cl.Create(ctx, secret)
+}
+
+// SetSecretAnnotation sets a single annotation on a Secret, creating the annotation map if needed.
+//
+// The read-modify-write is retried on conflict because the agent writes to the same object while a
+// plan is in flight: for the interrupt specs a 409 here is the normal path rather than a rare race,
+// since the whole point is to annotate a Secret the agent is actively reconciling.
+func SetSecretAnnotation(ctx context.Context, cl client.Client, namespace, name, key, value string) error {
+	return retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+		secret := &corev1.Secret{}
+		if err := cl.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, secret); err != nil {
+			return err
+		}
+		if secret.Annotations == nil {
+			secret.Annotations = map[string]string{}
+		}
+		secret.Annotations[key] = value
+		return cl.Update(ctx, secret)
+	})
+}
+
+// RemoveSecretAnnotation deletes a single annotation from a Secret. Removing an annotation and
+// setting it to "false" are indistinguishable to the agent; both release a hold. Retries on
+// conflict for the same reason SetSecretAnnotation does.
+func RemoveSecretAnnotation(ctx context.Context, cl client.Client, namespace, name, key string) error {
+	return retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+		secret := &corev1.Secret{}
+		if err := cl.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, secret); err != nil {
+			return err
+		}
+		if _, ok := secret.Annotations[key]; !ok {
+			// Already absent. Issuing the Update anyway would bump the resourceVersion for no
+			// reason, which the "the agent wrote nothing" specs would then have to explain away.
+			return nil
+		}
+		delete(secret.Annotations, key)
+		return cl.Update(ctx, secret)
+	})
+}
+
+// GetSecretResourceVersion returns a Secret's resourceVersion, for asserting that the agent wrote
+// nothing over an interval.
+func GetSecretResourceVersion(ctx context.Context, cl client.Client, namespace, name string) string {
+	secret := &corev1.Secret{}
+	Expect(cl.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, secret)).
+		NotTo(HaveOccurred(), "Failed to get secret %s/%s", namespace, name)
+	return secret.ResourceVersion
+}
+
+// GetPlanProgress retrieves and unmarshals the plan-progress checkpoint from a plan Secret.
+// Returns nil when the key is absent or empty.
+//
+// The checkpoint's JSON keys are checksum, completedInstructions, totalInstructions, resumeState
+// and paused. The last two are omitempty, so a cancellation report — which is never resumed from —
+// carries neither, and callers must treat an absent "paused" as false.
+func GetPlanProgress(ctx context.Context, cl client.Client, namespace, name string) map[string]any {
+	data := GetSecretData(ctx, cl, namespace, name)
+	raw, ok := data[k8splan.PlanProgressKey]
+	if !ok || len(raw) == 0 {
+		return nil
+	}
+	var result map[string]any
+	err := json.Unmarshal(raw, &result)
+	Expect(err).NotTo(HaveOccurred(), "Failed to unmarshal plan-progress")
+	return result
 }
 
 // WaitForSecretFieldCondition polls a Secret until the specified condition function returns true for the field.
