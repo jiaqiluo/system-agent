@@ -32,7 +32,7 @@ var _ = Describe("Remote Plan - Pause", Label(framework.ShortTestLabel), func() 
 		By("Verifying the instruction after the boundary has not run")
 		Consistently(func() bool { return nodeFileExists(ctx, podName, paths.stepTwo) },
 			15*time.Second, 3*time.Second).Should(BeFalse(),
-			"a held plan must not start the next instruction, including on the re-enqueues that follow")
+			"a held plan must not start the next instruction")
 
 		By("Verifying plan-progress records the suspension")
 		progress := framework.GetPlanProgress(ctx, cl,
@@ -85,8 +85,8 @@ var _ = Describe("Remote Plan - Pause", Label(framework.ShortTestLabel), func() 
 		pauseAtFirstBoundary(ctx, podName, paths, plan)
 
 		By("Verifying the probe reports healthy while the plan is held")
-		Eventually(func() bool { return probeIsHealthy(ctx, "held-probe") },
-			framework.WaitTimeout, 5*time.Second).Should(BeTrue(),
+		Eventually(func() any { return probeStatus(ctx, "held-probe")["healthy"] },
+			framework.WaitTimeout, 5*time.Second).Should(Equal(true),
 			"the probe should have run and succeeded on the interrupt path")
 
 		By("Removing the HTTP test server so the probe must start failing")
@@ -98,15 +98,24 @@ var _ = Describe("Remote Plan - Pause", Label(framework.ShortTestLabel), func() 
 		// most likely to be unhealthy — a plan stopped mid-flight leaves the node partly changed.
 		// The agent re-reconciles a held plan once a minute, so allow for more than one cycle.
 		//
-		// Asserted on failureCount rather than on healthy because ProbeStatus marshals with
-		// omitempty throughout: an unhealthy probe drops the healthy key rather than writing
-		// false, so a rising failureCount is the only positive evidence on the wire.
-		Eventually(func() int { return probeFailureCount(ctx, "held-probe") },
-			3*time.Minute, 5*time.Second).Should(BeNumerically(">=", 1),
+		// All three assertions run against one read of the Secret. The non-nil check is what stops
+		// this passing on a probe entry that vanished entirely, and healthy is asserted by its
+		// absence because ProbeStatus marshals with omitempty throughout: an unhealthy probe drops
+		// the key rather than writing false, so a rising failureCount is the only positive
+		// evidence on the wire.
+		Eventually(func(g Gomega) {
+			status := probeStatus(ctx, "held-probe")
+			g.Expect(status).NotTo(BeNil(), "the probe entry must still be recorded")
+			g.Expect(status["failureCount"]).To(BeNumerically(">=", 1))
+			g.Expect(status).NotTo(HaveKey("healthy"))
+		}, 3*time.Minute, 5*time.Second).Should(Succeed(),
 			"probe statuses must keep advancing while the plan is held")
-		Expect(probeIsHealthy(ctx, "held-probe")).To(BeFalse())
 
 		By("Verifying the plan is still held and still has not executed anything further")
+		// This is the suite's post-re-enqueue coverage for pause, and it is why the Consistently
+		// windows in the other pause specs do not need to be stretched past
+		// interruptedEnqueuePeriod: reaching this line took at least one full 60s re-enqueue
+		// cycle, because that is the cadence on which the failure above could be recorded at all.
 		Expect(currentPlanState(ctx)).To(Equal(k8splan.PlanStatePaused))
 		Expect(nodeFileExists(ctx, podName, paths.stepTwo)).To(BeFalse())
 	})
@@ -133,12 +142,35 @@ var _ = Describe("Remote Plan - Pause", Label(framework.ShortTestLabel), func() 
 		podName = framework.KubectlGetPodName(ctx, kubeconfigPath,
 			framework.E2ENamespace, framework.AgentLabel)
 
+		By("Waiting for the restarted agent to reconcile the held plan")
+		// KubectlWaitForPodsReady returns once the container is running — the DaemonSet declares
+		// no readinessProbe — which is not the same as the informer having delivered the Secret.
+		// Everything below would otherwise pass on an agent that has not yet looked at the plan at
+		// all, which is the most likely way for this spec to go quietly green while broken.
+		//
+		// This particular line is handlePause's write-once guard (pkg/k8splan/interrupt.go:284),
+		// so it proves more than that a reconcile happened: the new agent read the Secret, saw the
+		// hold, found its predecessor's checkpoint and declined to rewrite it. It is emitted at
+		// debug, which the DaemonSet enables via CATTLE_LOGLEVEL=debug and main.go:35-43 honours.
+		// The log is read from the new pod, whose output starts empty, so any occurrence is the
+		// restarted agent's.
+		Eventually(func() string {
+			return framework.KubectlGetLogs(ctx, kubeconfigPath, framework.E2ENamespace, podName)
+		}, framework.WaitTimeout, 5*time.Second).
+			Should(ContainSubstring("suspension already recorded for checksum"),
+				"the restarted agent must have reconciled the held plan and kept its predecessor's checkpoint")
+
 		By("Verifying the restarted agent neither resumes the plan nor rewrites the checkpoint")
 		// The checkpoint is keyed to the plan checksum and to nothing else — no per-process
 		// identifier — which is what lets it outlive the agent that wrote it. This is the only
 		// place that property is exercised against a real API server rather than a fake client,
 		// and it is the failure mode the whole design exists to prevent: "pause works until the
 		// agent restarts, and then the plan runs anyway".
+		//
+		// Deliberately not asserted by looking for the later instructions' files: the agent
+		// container's filesystem does not survive the pod being replaced, so /tmp comes back empty
+		// and any such check would be green whatever the agent did. plan-state and the checkpoint
+		// live in the Secret, which does survive, so they are the only honest evidence here.
 		Consistently(func() planapi.PlanState { return currentPlanState(ctx) },
 			30*time.Second, 5*time.Second).Should(Equal(k8splan.PlanStatePaused),
 			"a restarted agent must not resume a plan whose pause annotation is still set")
@@ -150,19 +182,11 @@ var _ = Describe("Remote Plan - Pause", Label(framework.ShortTestLabel), func() 
 		Expect(after["completedInstructions"]).To(Equal(before["completedInstructions"]),
 			"the restarted agent must keep its predecessor's progress rather than recompute it from a reconcile with no apply in flight")
 
-		By("Verifying nothing executed across the restart")
-		// Weaker than it looks, and deliberately called out: the agent container's filesystem does
-		// not survive the pod being replaced, so /tmp comes back empty and these paths would be
-		// absent either way. The checkpoint assertions above carry the weight; this still catches
-		// a restarted agent that runs the plan outright.
-		Expect(nodeFileExists(ctx, podName, paths.stepTwo)).To(BeFalse())
-		Expect(nodeFileExists(ctx, podName, paths.stepThree)).To(BeFalse())
-
 		By("Re-creating the gate so a wrongly re-executed first instruction would finish rather than hang")
 		// The first instruction blocks on the gate, which the restart also wiped. Without this a
-		// lost checkpoint would resume from instruction zero and stall there, and the spec would
-		// fail by timing out. With it, the spec fails on the marker below reading "one\ntwo\nthree"
-		// instead of "two\nthree", which says exactly what went wrong.
+		// lost checkpoint would resume from instruction zero and sit at the gate until its cap,
+		// and the spec would fail by timing out. With it, the spec fails on the marker below
+		// reading "one\ntwo\nthree" instead of "two\nthree", which says exactly what went wrong.
 		execInAgent(ctx, podName, "touch "+paths.gate)
 
 		By("Removing " + k8splan.PlanPausedAnnotation)
@@ -293,18 +317,12 @@ func newPausePaths(prefix string) pausePaths {
 }
 
 // pausePlan builds the fixture the pause specs share: three one-time instructions, each appending
-// a distinct line to a single marker file, with the first blocking on a gate file the spec
-// creates.
-//
-// The gate is what makes these specs deterministic rather than timing-dependent. With a fixed
-// sleep the spec would be betting that it can notice the instruction started, write the
-// annotation, and have the agent's interrupt watch poll for it, all inside the sleep. With a gate
-// the spec proves the agent has observed the annotation before it lets the instruction return, so
-// there is no window to lose.
+// a distinct line to a single marker file, with the first blocking on a gate file the spec creates
+// (see blockingScript for why it is a gate rather than a sleep, and for the cap that bounds it).
 func pausePlan(paths pausePaths) *framework.PlanBuilder {
 	return framework.NewPlan().
 		WithInstruction("step-one", "/bin/sh",
-			[]string{"-c", fmt.Sprintf("echo one >> %s; while [ ! -e %s ]; do sleep 1; done", paths.marker, paths.gate)}, true).
+			[]string{"-c", fmt.Sprintf("echo one >> %s; %s", paths.marker, blockingScript(paths.gate))}, true).
 		WithInstruction("step-two", "/bin/sh",
 			[]string{"-c", fmt.Sprintf("echo two >> %s; touch %s", paths.marker, paths.stepTwo)}, true).
 		WithInstruction("step-three", "/bin/sh",
@@ -317,7 +335,7 @@ func pausePlan(paths pausePaths) *framework.PlanBuilder {
 func pauseAtFirstBoundary(ctx context.Context, podName string, paths pausePaths, plan []byte) {
 	GinkgoHelper()
 
-	openGateOnCleanup(paths)
+	releaseGateOnCleanup(paths.gate)
 
 	By("Creating the plan Secret with plan-state:pending")
 	Expect(framework.CreatePlanSecretWithData(ctx, cl,
@@ -354,24 +372,6 @@ func pauseAtFirstBoundary(ctx context.Context, podName string, paths pausePaths,
 		framework.WaitTimeout, 2*time.Second)
 }
 
-// openGateOnCleanup guarantees the first instruction is released however the spec ends.
-//
-// Without it a spec that fails before opening the gate leaves that instruction looping forever,
-// and that does not merely leak a shell: Applyinator.Apply runs synchronously inside the
-// controller's single OnChange worker, so the agent is wedged and every spec after this one in the
-// suite times out. Errors are swallowed deliberately — this is a safety net, and a cleanup that
-// fails on its way out would bury the real failure under its own.
-func openGateOnCleanup(paths pausePaths) {
-	DeferCleanup(func() {
-		ctx := context.Background()
-		podName := framework.KubectlGetPodName(ctx, kubeconfigPath,
-			framework.E2ENamespace, framework.AgentLabel)
-		_, _, _ = framework.KubectlExec(ctx, kubeconfigPath,
-			framework.E2ENamespace, podName, framework.AgentContainerName,
-			[]string{"/bin/sh", "-c", "touch " + paths.gate})
-	})
-}
-
 // deleteAgentPod deletes the agent DaemonSet pod and blocks until the object is actually gone.
 //
 // Waiting matters: KubectlWaitForPodsReady selects on the DaemonSet's label, so returning while
@@ -392,33 +392,12 @@ func deleteAgentPod(ctx context.Context, podName string) {
 		"failed to delete agent pod %s: %s", podName, string(result.Stderr))
 }
 
-// probeStatusField reads one field of one probe out of the plan Secret's probe-statuses, returning
-// nil when the probe or the field is not there yet.
-func probeStatusField(ctx context.Context, probe, field string) any {
+// probeStatus returns one probe's recorded status from the plan Secret, or nil when the probe has
+// not been recorded yet. Callers index the result directly; indexing a nil map is safe, and every
+// field of ProbeStatus is omitempty, so an absent key and a zero value are the same thing on the
+// wire.
+func probeStatus(ctx context.Context, probe string) map[string]any {
 	statuses := framework.GetProbeStatuses(ctx, cl, framework.E2ENamespace, framework.PlanSecretName)
-	status, ok := statuses[probe].(map[string]any)
-	if !ok {
-		return nil
-	}
-	return status[field]
-}
-
-// probeIsHealthy reports whether a probe currently reports healthy.
-//
-// ProbeStatus.Healthy carries omitempty, so an unhealthy probe drops the key entirely rather than
-// writing false. Absent therefore means "not healthy", and a matcher fed the raw field would be
-// comparing nil to false forever.
-func probeIsHealthy(ctx context.Context, probe string) bool {
-	return probeStatusField(ctx, probe, "healthy") == true
-}
-
-// probeFailureCount reads a probe's consecutive failure count, returning 0 when the probe or the
-// field is absent — which, omitempty being what it is, is exactly what a count of zero looks like
-// on the wire.
-func probeFailureCount(ctx context.Context, probe string) int {
-	count, ok := probeStatusField(ctx, probe, "failureCount").(float64)
-	if !ok {
-		return 0
-	}
-	return int(count)
+	status, _ := statuses[probe].(map[string]any)
+	return status
 }
