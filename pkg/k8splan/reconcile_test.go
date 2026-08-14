@@ -831,6 +831,40 @@ func assertPathAbsent(t *testing.T, path, why string) {
 	}
 }
 
+// serveInterruptOnceApplyStarted stubs the interrupt watch's informer cache so annotation appears
+// only after startedSentinel exists — that is, only once the apply is genuinely in flight, and
+// never before Apply's pre-lock interruption check, which would abandon the apply before a single
+// instruction ran and make the resulting checkpoint meaningless.
+//
+// onServed is invoked with the number of polls that have served the annotation so far, on the same
+// goroutine as the watch. A caller can therefore act on served > 1 knowing that pollInterrupts has
+// already closed its channel on the previous poll, which is how a test releases a gated
+// instruction at an exactly-known point instead of guessing at a sleep.
+func serveInterruptOnceApplyStarted(t *testing.T, sc *fake.MockControllerInterface[*corev1.Secret, *corev1.SecretList],
+	annotation, startedSentinel string, onServed func(served int),
+) {
+	t.Helper()
+
+	var mu sync.Mutex
+	var served int
+	cache := fake.NewMockCacheInterface[*corev1.Secret](gomock.NewController(t))
+	sc.EXPECT().Cache().Return(cache).AnyTimes()
+	cache.EXPECT().Get(testNamespace, testSecret).DoAndReturn(func(string, string) (*corev1.Secret, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		observed := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: testNamespace, Name: testSecret}}
+		if _, err := os.Stat(startedSentinel); err != nil {
+			return observed, nil // the apply has not reached the instruction yet
+		}
+		served++
+		if onServed != nil {
+			onServed(served)
+		}
+		observed.Annotations = map[string]string{annotation: "true"}
+		return observed, nil
+	}).AnyTimes()
+}
+
 // syncBuffer is an io.Writer safe to read while logrus is writing to it.
 type syncBuffer struct {
 	mu  sync.Mutex
@@ -1174,26 +1208,13 @@ func TestReconcileSecretPauseDuringApplyIsNotRecordedAsAFailure(t *testing.T) {
 	// point pollInterrupts has certainly closed the pause channel, since both polls run in the
 	// same goroutine. So the pause lands strictly between the two instructions, with no timing
 	// assumption and no race against Apply's pre-lock interruption check.
-	var pollMu sync.Mutex
-	var pollsServingThePause int
-	cache := fake.NewMockCacheInterface[*corev1.Secret](gomock.NewController(t))
-	sc.EXPECT().Cache().Return(cache).AnyTimes()
-	cache.EXPECT().Get(testNamespace, testSecret).DoAndReturn(func(string, string) (*corev1.Secret, error) {
-		pollMu.Lock()
-		defer pollMu.Unlock()
-		observed := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: testNamespace, Name: testSecret}}
-		if _, err := os.Stat(firstSentinel); err != nil {
-			return observed, nil // instruction 0 has not started yet
-		}
-		pollsServingThePause++
-		if pollsServingThePause > 1 {
+	serveInterruptOnceApplyStarted(t, sc, PlanPausedAnnotation, firstSentinel, func(served int) {
+		if served > 1 {
 			if writeErr := os.WriteFile(gate, nil, 0600); writeErr != nil {
 				t.Errorf("failed to release the gate: %v", writeErr)
 			}
 		}
-		observed.Annotations = map[string]string{PlanPausedAnnotation: "true"}
-		return observed, nil
-	}).AnyTimes()
+	})
 
 	w := newTestWatcher(t, true, "42")
 	result, err := w.reconcileSecret(context.Background(), sc, secret, 30*time.Second)
@@ -1354,5 +1375,69 @@ func TestReconcileSecretResumeCommitDoesNotBumpPlanRevision(t *testing.T) {
 	// purpose, and a stale one must not leak into a later run.
 	if len(result.Data[PlanProgressKey]) != 0 {
 		t.Errorf("expected the checkpoint to be cleared by the outcome write, got %q", result.Data[PlanProgressKey])
+	}
+}
+
+// TestReconcileSecretCancelDuringApplyIsNotRecordedAsAFailure is the sharper half of the rule
+// above, and the one that pins Task 1's ordering contract literally. A cancel kills the in-flight
+// instruction, so the apply reports OneTimeApplySucceeded: false — testing that flag before
+// Interruption would record plan-state: failed, a failure count and a failed-checksum for a plan
+// the operator stopped deliberately, and would put it into the max-failures machinery it never
+// belonged in.
+//
+// (The pause case cannot pin this on its own: a pause lands at an instruction boundary with
+// nothing failed, so it reports OneTimeApplySucceeded: true and the same bug surfaces as a
+// spurious "succeeded" instead.)
+//
+// Not parallel: it shortens the package-level interruptPollInterval.
+func TestReconcileSecretCancelDuringApplyIsNotRecordedAsAFailure(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires a POSIX shell")
+	}
+	withInterruptPollInterval(t, 2*time.Millisecond)
+
+	sentinel := filepath.Join(t.TempDir(), "sleeper-started")
+	planBytes, checksum := marshalPlan(t, planapi.Plan{
+		OneTimeInstructions: []planapi.OneTimeInstruction{
+			{CommonInstruction: planapi.CommonInstruction{
+				Name: "sleeper", Command: "sh", Args: []string{"-c", "touch " + sentinel + "; sleep 60"},
+			}},
+		},
+	})
+
+	secret := newInterruptTestSecret(planBytes, nil, map[string][]byte{
+		planapi.PlanStateKey: []byte(planapi.PlanStatePending),
+	})
+	rec := newInterruptRecorder(secret)
+	sc := newInterruptTestController(t, rec)
+	// A cancel is prompt rather than a boundary, so no gate is needed: the instruction is killed
+	// where it stands.
+	serveInterruptOnceApplyStarted(t, sc, PlanCancelledAnnotation, sentinel, nil)
+
+	w := newTestWatcher(t, true, "42")
+	result, err := w.reconcileSecret(context.Background(), sc, secret, 30*time.Second)
+	if err != nil {
+		t.Fatalf("reconcileSecret returned error: %v", err)
+	}
+
+	if planapi.PlanState(result.Data[planapi.PlanStateKey]) != planapi.PlanStateCancelled {
+		t.Errorf("expected plan-state %q, got %q; a cancel-induced kill must not be reported as a plan failure",
+			planapi.PlanStateCancelled, result.Data[planapi.PlanStateKey])
+	}
+	if len(result.Data[FailedChecksumKey]) != 0 || len(result.Data[FailureCountKey]) != 0 || len(result.Data[FailedOutputKey]) != 0 {
+		t.Errorf("expected the failure bookkeeping to be untouched, got failed-checksum %q, failure-count %q, failed-output of %d bytes",
+			result.Data[FailedChecksumKey], result.Data[FailureCountKey], len(result.Data[FailedOutputKey]))
+	}
+	if len(result.Data[AppliedChecksumKey]) != 0 {
+		t.Errorf("expected applied-checksum NOT to be written for an unapplied plan, got %q", result.Data[AppliedChecksumKey])
+	}
+
+	got := checkpointIn(t, result.Data)
+	want := planProgress{Checksum: checksum, Completed: 0, Total: 1}
+	if got != want {
+		t.Errorf("expected a cancellation report %+v (never a suspension: nothing resumes from it), got %+v", want, got)
+	}
+	if periods := rec.enqueuePeriods(); len(periods) != 1 || periods[0] != interruptedEnqueuePeriod {
+		t.Errorf("expected a single re-enqueue after %v, got %v", interruptedEnqueuePeriod, periods)
 	}
 }
