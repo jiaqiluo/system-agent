@@ -724,6 +724,15 @@ func (r *interruptRecorder) enqueue(d time.Duration) {
 	r.enqueued = append(r.enqueued, d)
 }
 
+// setAnnotations replaces the annotations on the server-side copy, modelling the one write the
+// agent never makes: the orchestrator owns these keys, and the agent only ever reads them. Writes
+// merge into the freshly fetched object, so an annotation set here survives every later update.
+func (r *interruptRecorder) setAnnotations(annotations map[string]string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.server.Annotations = annotations
+}
+
 // writes returns the Secrets handed to each Update call, in order.
 func (r *interruptRecorder) writes() []*corev1.Secret {
 	r.mu.Lock()
