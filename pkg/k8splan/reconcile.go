@@ -102,11 +102,15 @@ func (w *watcher) reconcileSecret(ctx context.Context, sc corecontrollers.Secret
 		// The two returns below are a SAFETY PROPERTY, not an early-exit optimisation, and
 		// moving anything above them breaks the feature silently. In the plan-state flow the
 		// agent executes a plan only when both interrupt annotations read as an explicit
-		// false — absent, or the literal "false". Everything capable of starting work
-		// (resolveResume, the resume commit, decidePlanStateAction, the pending -> in-progress
-		// pre-commit, Apply) sits below them, so there is no ordering in which a held plan
-		// reaches any of it — including the first reconcile after an agent restart, which is
-		// what stops "pause works until the agent restarts, and then the plan runs anyway".
+		// false — absent, or the literal "false". Everything that acts — decidePlanStateAction,
+		// the pending -> in-progress pre-commit, the resume-commit write, and Apply — sits below
+		// them, so there is no ordering in which a held plan reaches any of it, including on the
+		// first reconcile after an agent restart. That is what stops "pause works until the
+		// agent restarts, and then the plan runs anyway".
+		//
+		// resolveResume, clampResumeFrom and resumeCommitUpdates sit below too, but they are
+		// pure: they compute and log, and their placement relative to these returns carries no
+		// safety weight. Only the four named above do.
 		if interruptErr != nil {
 			// Deliberately narrow: no Secret write (so resourceVersion is stable and the error
 			// cannot amplify into a write loop), no probes, no Apply, no EnqueueAfter. The
@@ -139,7 +143,16 @@ func (w *watcher) reconcileSecret(ctx context.Context, sc corecontrollers.Secret
 	//  3. It bounds the checkpoint's authority to the hold, so a crash during a resumed apply
 	//     falls back to re-executing from instruction 0 — the ordinary contract — rather than
 	//     trusting a record whose plan is no longer parked at an instruction boundary.
-	resumeUpdates := resumeCommitUpdates(currentPlanState, effectiveState, secret.Data, cp.Checksum)
+	//
+	// Plan-state flow only: the checksum flow has no checkpoint and therefore no resume commit.
+	// The gate is on the flow rather than on resumeCommitUpdates' own guard because that guard
+	// asks "is there a suspension to release", and a legacy Secret carrying a leftover checkpoint
+	// answers yes — which would materialise plan-state and plan-progress on a Secret owned by an
+	// orchestrator that knows nothing about either.
+	var resumeUpdates map[string][]byte
+	if effectiveState != "" {
+		resumeUpdates = resumeCommitUpdates(currentPlanState, effectiveState, secret.Data, cp.Checksum)
+	}
 
 	if effectiveState != "" {
 		psResult := decidePlanStateAction(effectiveState)
@@ -171,6 +184,18 @@ func (w *watcher) reconcileSecret(ctx context.Context, sc corecontrollers.Secret
 		committed, resumeErr := w.writeInterruptOutcome(sc, cp.Checksum, resumeUpdates)
 		if resumeErr != nil {
 			return secret, fmt.Errorf("failed to commit the resume into plan-state:%s: %w", effectiveState, resumeErr)
+		}
+		if committed != nil && !secretCarriesPlan(committed, cp.Checksum) {
+			// writeInterruptOutcome abandons its write, without an error, when a newer plan has
+			// landed. Carrying on from here would be destructive rather than merely wasteful:
+			// the in-hand copy still holds the OLD plan under PlanKey, and adopting the fetched
+			// resourceVersion would let the final updateSecret overwrite the orchestrator's new
+			// plan with it — with no conflict to stop it, since the resourceVersion now matches —
+			// and mark the old plan applied, so Rancher would compute InSync for a plan the
+			// planner never delivered. That plan's own reconcile owns the state; hand it back.
+			logrus.Infof("[k8splan] secret %s/%s carries a newer plan than %s; not resuming the plan this reconcile holds",
+				w.connInfo.Namespace, w.connInfo.SecretName, cp.Checksum)
+			return committed, nil
 		}
 		maps.Copy(secret.Data, resumeUpdates)
 		if committed != nil {

@@ -103,7 +103,6 @@ func TestBuildSecretDataUpdates(t *testing.T) {
 			},
 			want: map[string][]byte{
 				AppliedPeriodicOutputKey: []byte("periodic-a"),
-				PlanProgressKey:          {},
 				FailedChecksumKey:        []byte("checksum-a"),
 				// No FailureCountKey/FailedOutputKey/SuccessCountKey/LastApplyTimeKey: all gated on NeedsApplied.
 			},
@@ -122,7 +121,6 @@ func TestBuildSecretDataUpdates(t *testing.T) {
 			},
 			want: map[string][]byte{
 				AppliedPeriodicOutputKey: []byte("periodic-a"),
-				PlanProgressKey:          {},
 				FailedChecksumKey:        []byte("checksum-a"),
 				FailureCountKey:          []byte("1"),
 				FailedOutputKey:          []byte("output-a"),
@@ -167,14 +165,26 @@ func TestBuildSecretDataUpdatesAlwaysClearsThePlanProgressCheckpoint(t *testing.
 	tests := []struct {
 		name string
 		in   applyOutcomeInput
+		// wantCleared is false for the checksum flow, which has never owned this key.
+		wantCleared bool
 	}{
 		{
-			name: "success path",
-			in:   applyOutcomeInput{Checksum: "checksum-a", NeedsApplied: true, OneTimeApplySucceeded: true, UsesPlanState: true},
+			name:        "plan-state flow, success path",
+			in:          applyOutcomeInput{Checksum: "checksum-a", NeedsApplied: true, OneTimeApplySucceeded: true, UsesPlanState: true},
+			wantCleared: true,
 		},
 		{
-			name: "failure path",
-			in:   applyOutcomeInput{Checksum: "checksum-a", NeedsApplied: true, OneTimeApplySucceeded: false, UsesPlanState: true},
+			name:        "plan-state flow, failure path",
+			in:          applyOutcomeInput{Checksum: "checksum-a", NeedsApplied: true, OneTimeApplySucceeded: false, UsesPlanState: true},
+			wantCleared: true,
+		},
+		{
+			name: "checksum flow, success path: the key is never invented",
+			in:   applyOutcomeInput{Checksum: "checksum-a", NeedsApplied: true, OneTimeApplySucceeded: true, UsesPlanState: false},
+		},
+		{
+			name: "checksum flow, failure path: the key is never invented",
+			in:   applyOutcomeInput{Checksum: "checksum-a", NeedsApplied: true, OneTimeApplySucceeded: false, UsesPlanState: false},
 		},
 	}
 
@@ -183,6 +193,12 @@ func TestBuildSecretDataUpdatesAlwaysClearsThePlanProgressCheckpoint(t *testing.
 			t.Parallel()
 			got, _ := buildSecretDataUpdates(tt.in)
 			value, ok := got[PlanProgressKey]
+			if !tt.wantCleared {
+				if ok {
+					t.Errorf("expected the checksum flow never to write %q, got %q", PlanProgressKey, value)
+				}
+				return
+			}
 			if !ok {
 				t.Fatalf("expected %q to be present as an empty-value clear; a delete does not survive a conflict retry", PlanProgressKey)
 			}

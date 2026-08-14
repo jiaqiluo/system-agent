@@ -26,12 +26,19 @@ type applyOutcomeInput struct {
 func buildSecretDataUpdates(in applyOutcomeInput) map[string][]byte {
 	updates := map[string][]byte{
 		AppliedPeriodicOutputKey: in.PeriodicOutput,
+	}
+	if in.UsesPlanState {
 		// Both outcomes below are terminal for this apply, so the resume checkpoint has served
 		// its purpose and must not leak into a later run. Cleared as an empty value rather than
 		// a delete — see the comment on secretConflictMergeKeys: the conflict merge loop only
 		// carries over keys present in the in-hand copy, so a delete would be silently lost on
 		// a retry.
-		PlanProgressKey: {},
+		//
+		// Gated on the flow: the checksum flow never writes a checkpoint and nothing in it reads
+		// one, so clearing it there would invent a Secret data key on a Secret owned by an
+		// orchestrator that knows nothing about this feature. Unlike FailedOutputKey and
+		// FailedChecksumKey below, which that flow already owns, plan-progress is not its key.
+		updates[PlanProgressKey] = []byte{}
 	}
 
 	failed := (in.NeedsApplied && !in.OneTimeApplySucceeded) || (!in.NeedsApplied && in.WasFailedPlan)
