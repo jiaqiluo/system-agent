@@ -92,7 +92,7 @@ func (w *watcher) reconcileSecret(ctx context.Context, sc corecontrollers.Secret
 	// are ignored entirely in the checksum flow because that flow does not support them. In the
 	// plan-state flow, they determine whether this reconcile may execute any work.
 	if currentPlanState == "" {
-		for _, key := range []string{PlanCancelledAnnotation, PlanPausedAnnotation} {
+		for _, key := range []string{PlanCanceledAnnotation, PlanPausedAnnotation} {
 			if value, ok := secret.Annotations[key]; ok {
 				logrus.Warnf("[k8splan] ignoring unsupported annotation in checksum flow key=%s value=%s", key, value)
 			}

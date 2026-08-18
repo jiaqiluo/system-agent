@@ -1011,7 +1011,7 @@ func TestReconcileSecretInterruptAtEntrySuppressesTheApply(t *testing.T) {
 	}{
 		{
 			name:       "cancel on in-progress records a terminal cancellation and a report, not a suspension",
-			annotation: PlanCancelledAnnotation,
+			annotation: PlanCanceledAnnotation,
 			planState:  planapi.PlanStateInProgress,
 			wantState:  planapi.PlanStateCancelled,
 			wantPaused: false,
@@ -1169,7 +1169,7 @@ func TestReconcileSecretChecksumFlowIgnoresAnnotations(t *testing.T) {
 	})
 
 	// No plan-state key: the checksum flow. The annotation is set, and must change nothing.
-	secret := newInterruptTestSecret(planBytes, map[string]string{PlanCancelledAnnotation: "true"}, nil)
+	secret := newInterruptTestSecret(planBytes, map[string]string{PlanCanceledAnnotation: "true"}, nil)
 	rec := newInterruptRecorder(secret)
 	sc := newInterruptTestController(t, rec)
 
@@ -1194,7 +1194,7 @@ func TestReconcileSecretChecksumFlowIgnoresAnnotations(t *testing.T) {
 		t.Errorf("expected the checksum flow never to write %q at all, got %q", PlanProgressKey, value)
 	}
 
-	want := "ignoring unsupported annotation in checksum flow key=" + PlanCancelledAnnotation + " value=true"
+	want := "ignoring unsupported annotation in checksum flow key=" + PlanCanceledAnnotation + " value=true"
 	if !strings.Contains(logs(), want) {
 		t.Errorf("expected a warning containing %q, got:\n%s", want, logs())
 	}
@@ -1228,7 +1228,7 @@ func TestReconcileSecretChecksumFlowStartsNoInterruptWatch(t *testing.T) {
 	})
 
 	secret := newInterruptTestSecret(planBytes,
-		map[string]string{PlanPausedAnnotation: "true", PlanCancelledAnnotation: "true"}, nil)
+		map[string]string{PlanPausedAnnotation: "true", PlanCanceledAnnotation: "true"}, nil)
 	rec := newInterruptRecorder(secret)
 	sc := newInterruptTestController(t, rec)
 
@@ -1505,7 +1505,7 @@ func TestReconcileSecretCancelDuringApplyIsNotRecordedAsAFailure(t *testing.T) {
 	sc := newInterruptTestController(t, rec)
 	// A cancel is prompt rather than a boundary, so no gate is needed: the instruction is killed
 	// where it stands.
-	serveInterruptOnceApplyStarted(t, sc, PlanCancelledAnnotation, sentinel, nil)
+	serveInterruptOnceApplyStarted(t, sc, PlanCanceledAnnotation, sentinel, nil)
 
 	w := newTestWatcher(t, true, "42")
 	result, err := w.reconcileSecret(context.Background(), sc, secret, 30*time.Second)
@@ -1672,7 +1672,7 @@ func TestReconcileSecretInterruptDuringAPeriodicApplyOfATerminalPlan(t *testing.
 	}{
 		{
 			name:       "cancelling writes nothing: plan-state is already terminal",
-			annotation: PlanCancelledAnnotation,
+			annotation: PlanCanceledAnnotation,
 		},
 		{
 			name:         "pausing still records, because the resume reads the checkpoint back",

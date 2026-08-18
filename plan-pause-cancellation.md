@@ -72,10 +72,10 @@ New constants in `pkg/k8splan/watcher.go`:
 // TODO: upstream these into github.com/rancher/rancher/pkg/plan alongside PlanStateCancelled,
 // then drop the local definitions and bump the dependency.
 
-// PlanCancelledAnnotation, set to "true" on the plan Secret, requests that the agent abort the plan.
+// PlanCanceledAnnotation, set to "true" on the plan Secret, requests that the agent abort the plan.
 // Removing it does not un-cancel: the plan is terminal and waits for new content.
 // The only valid values are "true" and "false"; see readInterrupt.
-PlanCancelledAnnotation = "plan.cattle.io/cancelled"
+PlanCanceledAnnotation = "plan.cattle.io/cancelled"
 // PlanPausedAnnotation, set to "true" on the plan Secret, requests that the agent hold execution.
 // While it is set the agent executes nothing for this plan, whatever plan-state or the resume
 // checkpoint say; clearing it is the only thing that resumes the plan.
@@ -894,10 +894,10 @@ copies:
 // plan-progress when the annotation is removed.
 PlanStatePaused PlanState = "paused"
 
-// PlanCancelledAnnotation / PlanPausedAnnotation request that the agent abort or hold the plan.
+// PlanCanceledAnnotation / PlanPausedAnnotation request that the agent abort or hold the plan.
 // The only valid values are "true" and "false"; an absent annotation is "false". The agent rejects
 // anything else rather than guessing, so producers must not write other spellings.
-PlanCancelledAnnotation = "plan.cattle.io/cancelled"
+PlanCanceledAnnotation = "plan.cattle.io/cancelled"
 PlanPausedAnnotation    = "plan.cattle.io/paused"
 
 // PlanProgressKey is the Secret data key holding the agent's resume checkpoint.
@@ -954,7 +954,7 @@ been removed and `plan-state` is still `cancelled`, call `UpdatePlan` to rewrite
 the annotation is what re-arms the node:
 
 ```go
-v, ok := entry.Metadata.Annotations[planapi.PlanCancelledAnnotation]
+v, ok := entry.Metadata.Annotations[planapi.PlanCanceledAnnotation]
 if entry.Plan.PlanState == planapi.PlanStateCancelled && (!ok || v == "false") {
     // operator cleared the cancellation; re-drive the existing plan
 }

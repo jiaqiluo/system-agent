@@ -2,7 +2,7 @@ package k8splan
 
 // This file enforces the plan-state execution invariant:
 //
-// The agent executes a plan only when both PlanPausedAnnotation and PlanCancelledAnnotation are
+// The agent executes a plan only when both PlanPausedAnnotation and PlanCanceledAnnotation are
 // explicitly inactive: absent or set to "false". Any other value suppresses execution, regardless
 // of the plan state, checkpoint, or how the agent reached reconciliation.
 //
@@ -60,7 +60,7 @@ func parseInterruptAnnotation(annotations map[string]string, key string) (bool, 
 //  3. A valid paused == "true" pauses the plan.
 //  4. Otherwise, the plan may run.
 func readInterrupt(annotations map[string]string) (applyinator.Interruption, error) {
-	cancelled, cancelErr := parseInterruptAnnotation(annotations, PlanCancelledAnnotation)
+	cancelled, cancelErr := parseInterruptAnnotation(annotations, PlanCanceledAnnotation)
 	paused, pauseErr := parseInterruptAnnotation(annotations, PlanPausedAnnotation)
 
 	if cancelErr == nil && cancelled {
@@ -153,7 +153,7 @@ func (w *watcher) pollInterrupts(ctx context.Context, sc corecontrollers.SecretC
 		switch interrupt {
 		case applyinator.InterruptionCanceled:
 			if !cancelClosed {
-				logrus.Infof("[k8splan] %s observed during an in-flight apply; cancelling it", PlanCancelledAnnotation)
+				logrus.Infof("[k8splan] %s observed during an in-flight apply; cancelling it", PlanCanceledAnnotation)
 				close(cancel)
 				cancelClosed = true
 			}
@@ -251,7 +251,7 @@ func handleCancellation(currentPlanState planapi.PlanState, data map[string][]by
 		}),
 	}
 	logrus.Infof("[k8splan] %s is set; recording plan-state %q after %d of %d one-time instructions",
-		PlanCancelledAnnotation, planapi.PlanStateCancelled, completed, totalOneTimeInstructions)
+		PlanCanceledAnnotation, planapi.PlanStateCancelled, completed, totalOneTimeInstructions)
 	return updates
 }
 

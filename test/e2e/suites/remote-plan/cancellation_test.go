@@ -55,10 +55,10 @@ var _ = Describe("Remote Plan - Cancellation", Label(framework.ShortTestLabel), 
 			func(val []byte) bool { return planapi.PlanState(val) == planapi.PlanStateInProgress },
 			framework.WaitTimeout, time.Second)
 
-		By("Setting " + k8splan.PlanCancelledAnnotation + " while the first instruction is still running")
+		By("Setting " + k8splan.PlanCanceledAnnotation + " while the first instruction is still running")
 		Expect(framework.SetSecretAnnotation(ctx, cl,
 			framework.E2ENamespace, framework.PlanSecretName,
-			k8splan.PlanCancelledAnnotation, "true")).To(Succeed())
+			k8splan.PlanCanceledAnnotation, "true")).To(Succeed())
 
 		By("Waiting for plan-state to become cancelled")
 		// Cancel is prompt: the in-flight instruction's context is canceled rather than being
@@ -95,7 +95,7 @@ var _ = Describe("Remote Plan - Cancellation", Label(framework.ShortTestLabel), 
 		podName := framework.KubectlGetPodName(ctx, kubeconfigPath,
 			framework.E2ENamespace, framework.AgentLabel)
 
-		By("Creating a pending plan that already carries " + k8splan.PlanCancelledAnnotation)
+		By("Creating a pending plan that already carries " + k8splan.PlanCanceledAnnotation)
 		// No gate and no cleanup are needed here: the annotation is present before the agent's
 		// first reconcile, so recordInterruptAtEntry returns before Apply is ever called and no
 		// instruction can be left running.
@@ -107,7 +107,7 @@ var _ = Describe("Remote Plan - Cancellation", Label(framework.ShortTestLabel), 
 		Expect(framework.CreatePlanSecretWithAnnotations(ctx, cl,
 			framework.E2ENamespace, framework.PlanSecretName, plan,
 			map[string][]byte{planapi.PlanStateKey: []byte(planapi.PlanStatePending)},
-			map[string]string{k8splan.PlanCancelledAnnotation: "true"})).To(Succeed())
+			map[string]string{k8splan.PlanCanceledAnnotation: "true"})).To(Succeed())
 
 		By("Waiting for plan-state to become cancelled")
 		framework.WaitForSecretFieldCondition(ctx, cl,
@@ -159,12 +159,12 @@ var _ = Describe("Remote Plan - Cancellation", Label(framework.ShortTestLabel), 
 				k8splan.AppliedChecksumKey: []byte(""),
 				k8splan.ProbeStatusesKey:   []byte("{}"),
 			},
-			map[string]string{k8splan.PlanCancelledAnnotation: "true"})).To(Succeed())
+			map[string]string{k8splan.PlanCanceledAnnotation: "true"})).To(Succeed())
 
 		By("Removing the cancel annotation")
 		Expect(framework.RemoveSecretAnnotation(ctx, cl,
 			framework.E2ENamespace, framework.PlanSecretName,
-			k8splan.PlanCancelledAnnotation)).To(Succeed())
+			k8splan.PlanCanceledAnnotation)).To(Succeed())
 		rvAfterRemove := framework.GetSecretResourceVersion(ctx, cl,
 			framework.E2ENamespace, framework.PlanSecretName)
 
@@ -232,10 +232,10 @@ var _ = Describe("Remote Plan - Cancellation", Label(framework.ShortTestLabel), 
 			framework.WaitTimeout, 2*time.Second).Should(BeNumerically(">=", 2),
 			"the backgrounded child should be looping before the cancel is issued")
 
-		By("Setting " + k8splan.PlanCancelledAnnotation)
+		By("Setting " + k8splan.PlanCanceledAnnotation)
 		Expect(framework.SetSecretAnnotation(ctx, cl,
 			framework.E2ENamespace, framework.PlanSecretName,
-			k8splan.PlanCancelledAnnotation, "true")).To(Succeed())
+			k8splan.PlanCanceledAnnotation, "true")).To(Succeed())
 
 		By("Waiting for plan-state to become cancelled")
 		framework.WaitForSecretFieldCondition(ctx, cl,

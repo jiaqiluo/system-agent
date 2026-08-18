@@ -214,12 +214,12 @@ var _ = Describe("Remote Plan - Failure Handling", Label(framework.ShortTestLabe
 				k8splan.FailureCountKey:   []byte("3"),
 				k8splan.ProbeStatusesKey:  []byte("{}"),
 			},
-			map[string]string{k8splan.PlanCancelledAnnotation: "true"})).To(Succeed())
+			map[string]string{k8splan.PlanCanceledAnnotation: "true"})).To(Succeed())
 
 		By("Removing the cancel annotation")
 		Expect(framework.RemoveSecretAnnotation(ctx, cl,
 			framework.E2ENamespace, framework.PlanSecretName,
-			k8splan.PlanCancelledAnnotation)).To(Succeed())
+			k8splan.PlanCanceledAnnotation)).To(Succeed())
 		rvAfterRemove := framework.GetSecretResourceVersion(ctx, cl,
 			framework.E2ENamespace, framework.PlanSecretName)
 

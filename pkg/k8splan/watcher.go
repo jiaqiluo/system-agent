@@ -60,21 +60,21 @@ const (
 	// PlanKey is the Secret data key for the plan payload.
 	PlanKey = "plan"
 
-	// TODO: upstream these into github.com/rancher/rancher/pkg/plan alongside PlanStateCancelled,
+	// TODO: upstream these into github.com/rancher/rancher/pkg/plan alongside PlanStateCanceled,
 	// then drop the local definitions and bump the dependency.
 
-	// PlanCancelledAnnotation is the Secret annotation used to cancel a plan.
+	// PlanCanceledAnnotation is the Secret annotation used to cancel a plan.
 	// Setting it to "true" requests that the agent abort the plan.
 	// Removing the annotation does not resume the plan: cancellation is terminal and requires new content.
-	// The only valid values are "true" and "false"; see readInterrupt.
-	PlanCancelledAnnotation = "plan.cattle.io/cancelled"
+	// The only valid values are "true" and "false".
+	PlanCanceledAnnotation = "plan.cattle.io/canceled"
 	// PlanPausedAnnotation is the Secret annotation used to pause a plan.
 	// Setting it to "true" requests that the agent stop executing the plan.
 	// While set, the agent performs no plan execution regardless of plan state or resume checkpoint.
 	// Clearing the annotation or setting it to "false" resumes the plan.
-	// The only valid values are "true" and "false"; see readInterrupt.
+	// The only valid values are "true" and "false".
 	PlanPausedAnnotation = "plan.cattle.io/paused"
-	// PlanProgressKey is the Secret data key holding the resume checkpoint (JSON, see planProgress).
+	// PlanProgressKey is the Secret data key holding the resume checkpoint.
 	PlanProgressKey = "plan-progress"
 
 	enqueueAfterDuration  = "5s"

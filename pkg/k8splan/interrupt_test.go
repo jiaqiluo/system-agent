@@ -30,7 +30,7 @@ const absentAnnotation = "\x00absent"
 func interruptAnnotations(cancelled, paused string) map[string]string {
 	annotations := map[string]string{}
 	if cancelled != absentAnnotation {
-		annotations[PlanCancelledAnnotation] = cancelled
+		annotations[PlanCanceledAnnotation] = cancelled
 	}
 	if paused != absentAnnotation {
 		annotations[PlanPausedAnnotation] = paused
@@ -98,7 +98,7 @@ func TestParseInterruptAnnotationRejectsParseBoolSpellings(t *testing.T) {
 		t.Run(value, func(t *testing.T) {
 			t.Parallel()
 
-			if _, err := parseInterruptAnnotation(map[string]string{PlanCancelledAnnotation: value}, PlanCancelledAnnotation); err == nil {
+			if _, err := parseInterruptAnnotation(map[string]string{PlanCanceledAnnotation: value}, PlanCanceledAnnotation); err == nil {
 				t.Errorf("value %q was accepted; only the exact spellings \"true\" and \"false\" are valid", value)
 			}
 		})
@@ -166,7 +166,7 @@ func TestReadInterrupt(t *testing.T) {
 			name:      "both values invalid: one joined error naming both keys",
 			cancelled: "maybe", paused: "nope",
 			want: applyinator.InterruptionNone, wantErr: true,
-			wantErrMentions: []string{PlanCancelledAnnotation, PlanPausedAnnotation},
+			wantErrMentions: []string{PlanCanceledAnnotation, PlanPausedAnnotation},
 		},
 		{
 			name:      "an invalid cancel value does not let a valid pause take effect",
@@ -511,7 +511,7 @@ func TestStartInterruptWatchObservesAnnotations(t *testing.T) {
 	}{
 		{
 			name:       "a cancellation appearing on a later poll closes the cancel channel",
-			steps:      []map[string]string{{}, {PlanCancelledAnnotation: "true"}},
+			steps:      []map[string]string{{}, {PlanCanceledAnnotation: "true"}},
 			wantCancel: true,
 		},
 		{
@@ -521,7 +521,7 @@ func TestStartInterruptWatchObservesAnnotations(t *testing.T) {
 		},
 		{
 			name:       "cancel wins when both annotations appear at once",
-			steps:      []map[string]string{{}, {PlanCancelledAnnotation: "true", PlanPausedAnnotation: "true"}},
+			steps:      []map[string]string{{}, {PlanCanceledAnnotation: "true", PlanPausedAnnotation: "true"}},
 			wantCancel: true,
 		},
 		{
@@ -532,13 +532,13 @@ func TestStartInterruptWatchObservesAnnotations(t *testing.T) {
 		},
 		{
 			name:       "a failing cache read falls back to the API server and still observes a cancellation",
-			steps:      []map[string]string{{}, {PlanCancelledAnnotation: "true"}},
+			steps:      []map[string]string{{}, {PlanCanceledAnnotation: "true"}},
 			cacheErr:   errors.New("cache has not synced"),
 			wantCancel: true,
 		},
 		{
 			name:  "explicitly false annotations close nothing",
-			steps: []map[string]string{{PlanCancelledAnnotation: "false", PlanPausedAnnotation: "false"}},
+			steps: []map[string]string{{PlanCanceledAnnotation: "false", PlanPausedAnnotation: "false"}},
 		},
 	}
 

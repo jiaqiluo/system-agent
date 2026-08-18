@@ -238,7 +238,7 @@ func suppressionMatrix() []suppressionRow {
 			// cancelled, so the guard's absence is visible. Not reachable from any
 			// paused-annotation row, so the row carries its own annotation.
 			name:        "succeeded then cancelled: cancel's write-once guard keys off the terminal plan-state",
-			annotation:  PlanCancelledAnnotation,
+			annotation:  PlanCanceledAnnotation,
 			planState:   planapi.PlanStateSucceeded,
 			checkpoint:  &planProgress{Completed: 2, Total: 3},
 			wantUpdates: 0,
