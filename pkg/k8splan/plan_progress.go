@@ -16,6 +16,7 @@ type planProgress struct {
 	Completed   int               `json:"completedInstructions"`
 	Total       int               `json:"totalInstructions"`
 	ResumeState planapi.PlanState `json:"resumeState,omitempty"` // state restored when the pause lifts
+
 	// Paused identifies the record as a suspension rather than a status report and is the sole gate for
 	// honoring Completed as a resume checkpoint. Only a suspended checkpoint can be used to resume.
 	//

@@ -1535,6 +1535,111 @@ func TestReconcileSecretCancelDuringApplyIsNotRecordedAsAFailure(t *testing.T) {
 	}
 }
 
+func TestReconcileSecretCancelledTerminalPlanMonitorsOnly(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires a POSIX shell")
+	}
+	t.Parallel()
+
+	periodicSentinel := filepath.Join(t.TempDir(), "periodic-ran")
+	planBytes, checksum := marshalPlan(t, planapi.Plan{
+		PeriodicInstructions: []planapi.PeriodicInstruction{
+			{CommonInstruction: planapi.CommonInstruction{
+				Name: "periodic", Command: "sh", Args: []string{"-c", "touch " + periodicSentinel},
+			}},
+		},
+	})
+
+	cancelReport := marshalPlanProgress(planProgress{Checksum: checksum, Completed: 1, Total: 2})
+	secret := newInterruptTestSecret(planBytes, nil, map[string][]byte{
+		planapi.PlanStateKey: []byte(planapi.PlanStateCancelled),
+		AppliedChecksumKey:   []byte(""),
+		PlanProgressKey:      cancelReport,
+		ProbeStatusesKey:     []byte("{}"),
+	})
+	rec := newInterruptRecorder(secret)
+	sc := newInterruptTestController(t, rec)
+
+	w := newTestWatcher(t, true, "42")
+	result, err := w.reconcileSecret(context.Background(), sc, secret, 30*time.Second)
+	if err != nil {
+		t.Fatalf("reconcileSecret returned error: %v", err)
+	}
+
+	assertPathAbsent(t, periodicSentinel, "a cancelled terminal plan should be monitored only")
+	if got := planapi.PlanState(result.Data[planapi.PlanStateKey]); got != planapi.PlanStateCancelled {
+		t.Errorf("expected plan-state to remain %q, got %q", planapi.PlanStateCancelled, got)
+	}
+	if got := string(result.Data[AppliedChecksumKey]); got != "" {
+		t.Errorf("expected applied-checksum to remain empty for a cancelled plan, got %q", got)
+	}
+	if !bytes.Equal(result.Data[PlanProgressKey], cancelReport) {
+		t.Errorf("expected cancellation report to be preserved, got %q want %q", result.Data[PlanProgressKey], cancelReport)
+	}
+	if writes := rec.writes(); len(writes) != 0 {
+		t.Fatalf("expected no lifecycle write in monitoring-only mode, got %d", len(writes))
+	}
+	if periods := rec.enqueuePeriods(); len(periods) != 1 || periods[0] != w.probePeriod {
+		t.Errorf("expected a single re-enqueue after %v, got %v", w.probePeriod, periods)
+	}
+}
+
+func TestReconcileSecretFailedTerminalPlanMonitorsOnly(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires a POSIX shell")
+	}
+	t.Parallel()
+
+	periodicSentinel := filepath.Join(t.TempDir(), "failed-periodic-ran")
+	planBytes, checksum := marshalPlan(t, planapi.Plan{
+		PeriodicInstructions: []planapi.PeriodicInstruction{
+			{CommonInstruction: planapi.CommonInstruction{
+				Name: "periodic", Command: "sh", Args: []string{"-c", "touch " + periodicSentinel},
+			}},
+		},
+	})
+
+	progressReport := marshalPlanProgress(planProgress{Checksum: checksum, Completed: 0, Total: 1})
+	secret := newInterruptTestSecret(planBytes, nil, map[string][]byte{
+		planapi.PlanStateKey: []byte(planapi.PlanStateFailed),
+		PlanProgressKey:      progressReport,
+		FailedChecksumKey:    []byte(checksum),
+		FailureCountKey:      []byte("2"),
+		ProbeStatusesKey:     []byte("{}"),
+	})
+	rec := newInterruptRecorder(secret)
+	sc := newInterruptTestController(t, rec)
+
+	w := newTestWatcher(t, true, "42")
+	result, err := w.reconcileSecret(context.Background(), sc, secret, 30*time.Second)
+	if err != nil {
+		t.Fatalf("reconcileSecret returned error: %v", err)
+	}
+
+	assertPathAbsent(t, periodicSentinel, "a failed terminal plan should be monitored only")
+	if got := planapi.PlanState(result.Data[planapi.PlanStateKey]); got != planapi.PlanStateFailed {
+		t.Errorf("expected plan-state to remain %q, got %q", planapi.PlanStateFailed, got)
+	}
+	if got := string(result.Data[AppliedChecksumKey]); got != "" {
+		t.Errorf("expected applied-checksum to remain unset for a failed terminal plan, got %q", got)
+	}
+	if !bytes.Equal(result.Data[PlanProgressKey], progressReport) {
+		t.Errorf("expected plan-progress report to be preserved, got %q want %q", result.Data[PlanProgressKey], progressReport)
+	}
+	if got := string(result.Data[FailureCountKey]); got != "2" {
+		t.Errorf("expected failure count to be preserved, got %q", got)
+	}
+	if got := string(result.Data[FailedChecksumKey]); got != checksum {
+		t.Errorf("expected failed-checksum to be preserved, got %q want %q", got, checksum)
+	}
+	if writes := rec.writes(); len(writes) != 0 {
+		t.Fatalf("expected no lifecycle write in monitoring-only mode, got %d", len(writes))
+	}
+	if periods := rec.enqueuePeriods(); len(periods) != 1 || periods[0] != w.probePeriod {
+		t.Errorf("expected a single re-enqueue after %v, got %v", w.probePeriod, periods)
+	}
+}
+
 // TestReconcileSecretInterruptDuringAPeriodicApplyOfATerminalPlan pins that the mid-apply
 // interrupt path applies cancel's terminal write-once guard exactly where the reconcile-entry path
 // applies it, and — the other half, which is what makes the guard's cancel-only-ness load-bearing

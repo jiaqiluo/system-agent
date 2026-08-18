@@ -17,7 +17,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 )
 
-// interruptedEnqueuePeriod controls how often a held or cancelled plan is re-enqueued. Annotation
+// interruptedEnqueuePeriod controls how often a held or canceled plan is re-enqueued. Annotation
 // removal is delivered through a watch event, so this periodic enqueue is only a safety net for
 // missed events. Using probePeriod (5s by default) would unnecessarily churn the workqueue on
 // every node throughout a pause.
@@ -102,7 +102,7 @@ func (w *watcher) reconcileSecret(ctx context.Context, sc corecontrollers.Secret
 		if interruptErr != nil {
 			// Keep this path deliberately narrow: do not write the Secret, run probes, call Apply, or schedule
 			// an EnqueueAfter. The workqueue's exponential rate limiter handles retries, and correcting the
-			// annotation is delivered through a watch event.
+			// annotation will arrive through a watch event.
 			logrus.Errorf("[k8splan] refusing to act on plan secret %s/%s: %v", w.connInfo.Namespace, w.connInfo.SecretName, interruptErr)
 			return secret, interruptErr
 		}
@@ -126,10 +126,12 @@ func (w *watcher) reconcileSecret(ctx context.Context, sc corecontrollers.Secret
 		}
 	}
 
-	// Step B: everything below runs only in the checksum flow or in the plan-state flow where both
-	// interrupt annotations are explicitly inactive. effectiveState is the plan state used by this
-	// reconcile; resumeFrom identifies the position from which an apply that has already been approved
-	// should resume.
+	// Step B: everything below runs only in two scenarios:
+	// - the checksum flow, or
+	// - in the plan-state flow where both interrupt annotations are explicitly inactive.
+	//
+	// effectiveState is the plan state used by this reconcile; resumeFrom identifies the position
+	// from which an apply that has already been approved should resume.
 	effectiveState, resumeFrom := resolveResume(currentPlanState, secret.Data, cp.Checksum)
 	resumeFrom = clampResumeFrom(resumeFrom, len(cp.Plan.OneTimeInstructions))
 
@@ -209,6 +211,34 @@ func (w *watcher) reconcileSecret(ctx context.Context, sc corecontrollers.Secret
 	output := selectExistingOutput(secret.Data, wasFailedPlan)
 
 	periodicOutput := secret.Data[AppliedPeriodicOutputKey]
+
+	if effectiveState.IsTerminal() && effectiveState != planapi.PlanStateSucceeded && !needsApplied {
+		// A non-succeeded terminal plan is monitored only. Do not execute instructions or mutate
+		// lifecycle keys such as applied-checksum and plan-progress until new pending content arrives.
+		beforeMonitoring := secret.DeepCopy()
+		prober.DoProbes(cp.Plan.Probes, probeStatuses, false)
+
+		marshalledProbeStatus, marshalErr := json.Marshal(probeStatuses)
+		if marshalErr != nil {
+			logrus.Errorf("[k8splan] error while marshalling probe statuses: %v", marshalErr)
+		} else {
+			secret.Data[ProbeStatusesKey] = marshalledProbeStatus
+		}
+
+		logrus.Debugf("[k8splan] terminal plan-state %q is in monitoring-only mode; enqueueing after %f seconds", effectiveState, w.probePeriod.Seconds())
+		sc.EnqueueAfter(w.connInfo.Namespace, w.connInfo.SecretName, w.probePeriod)
+
+		if reflect.DeepEqual(beforeMonitoring.Data, secret.Data) && reflect.DeepEqual(beforeMonitoring.StringData, secret.StringData) {
+			logrus.Debugf("[k8splan] monitoring-only reconcile changed nothing, not updating secret")
+			return secret, nil
+		}
+		secret, err = w.updateSecret(sc, secret)
+		if err != nil {
+			logrus.Fatalf("[k8splan] encountered an error while attempting to update the secret: %v", err)
+			return nil, nil
+		}
+		return secret, nil
+	}
 
 	// Transition pending -> in-progress before executing so the state is durable
 	// in the event of a crash. On restart the agent will see in-progress and re-execute.
@@ -357,9 +387,9 @@ func (w *watcher) recordInterruptAfterApply(sc corecontrollers.SecretController,
 		progress.Completed = applyOutput.CompletedOneTimeInstructions
 		progress.Total = len(cp.Plan.OneTimeInstructions)
 	} else {
-		// Periodic-only: restore the state the monitoring reconcile was in. Defaulting this to
-		// in-progress would re-execute a completed Day 2 operation in full on unpause. There is
-		// nothing to resume, so Completed and Total stay 0.
+		// Periodic-only: restore the state from the monitoring reconcile. Defaulting to in-progress
+		// would re-execute a completed Day 2 operation from the beginning on unpause. Nothing remains
+		// to resume, so Completed and Total stay 0.
 		progress.ResumeState = effectiveState
 	}
 

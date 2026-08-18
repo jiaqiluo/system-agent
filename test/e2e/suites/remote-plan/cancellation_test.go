@@ -22,6 +22,7 @@ const (
 	cancelRunningGate    = "/tmp/e2e-cancel-running-gate"
 	cancelRunningStepTwo = "/tmp/e2e-cancel-running-step-two.txt"
 	cancelPendingRan     = "/tmp/e2e-cancel-pending-ran.txt"
+	cancelTerminalRan    = "/tmp/e2e-cancel-terminal-periodic-ran.txt"
 	cancelTreeGate       = "/tmp/e2e-cancel-tree-gate"
 	cancelTreeChildLog   = "/tmp/e2e-cancel-tree-child.log"
 )
@@ -136,6 +137,59 @@ var _ = Describe("Remote Plan - Cancellation", Label(framework.ShortTestLabel), 
 		By("Verifying applied-checksum was not written")
 		Expect(framework.GetAppliedChecksum(ctx, cl,
 			framework.E2ENamespace, framework.PlanSecretName)).To(BeEmpty())
+	})
+
+	It("should stay monitoring-only after cancel annotation is removed from a cancelled plan", func() {
+		ctx := context.Background()
+		podName := framework.KubectlGetPodName(ctx, kubeconfigPath,
+			framework.E2ENamespace, framework.AgentLabel)
+		const cancelReport = `{"checksum":"cancelled-report","completedInstructions":1,"totalInstructions":2}`
+
+		By("Creating a cancelled terminal plan with periodic instructions")
+		plan := framework.NewPlan().
+			WithPeriodicInstruction("should-not-run-after-cancel", "/bin/sh",
+				[]string{"-c", "touch " + cancelTerminalRan}, 5).
+			Build()
+
+		Expect(framework.CreatePlanSecretWithAnnotations(ctx, cl,
+			framework.E2ENamespace, framework.PlanSecretName, plan,
+			map[string][]byte{
+				planapi.PlanStateKey:       []byte(planapi.PlanStateCancelled),
+				k8splan.PlanProgressKey:    []byte(cancelReport),
+				k8splan.AppliedChecksumKey: []byte(""),
+				k8splan.ProbeStatusesKey:   []byte("{}"),
+			},
+			map[string]string{k8splan.PlanCancelledAnnotation: "true"})).To(Succeed())
+
+		By("Removing the cancel annotation")
+		Expect(framework.RemoveSecretAnnotation(ctx, cl,
+			framework.E2ENamespace, framework.PlanSecretName,
+			k8splan.PlanCancelledAnnotation)).To(Succeed())
+		rvAfterRemove := framework.GetSecretResourceVersion(ctx, cl,
+			framework.E2ENamespace, framework.PlanSecretName)
+
+		By("Verifying no plan instructions run after cancellation is reported")
+		Consistently(func() bool { return nodeFileExists(ctx, podName, cancelTerminalRan) },
+			20*time.Second, 4*time.Second).Should(BeFalse(),
+			"clearing the cancel annotation must not re-enable execution on a terminal cancelled plan")
+
+		By("Verifying the cancellation report and checksum remain untouched")
+		progress := framework.GetPlanProgress(ctx, cl,
+			framework.E2ENamespace, framework.PlanSecretName)
+		Expect(progress).NotTo(BeNil())
+		Expect(progress["checksum"]).To(Equal("cancelled-report"))
+		Expect(progress["completedInstructions"]).To(BeEquivalentTo(1))
+		Expect(progress["totalInstructions"]).To(BeEquivalentTo(2))
+		Expect(progress).NotTo(HaveKey("paused"))
+		Expect(framework.GetAppliedChecksum(ctx, cl,
+			framework.E2ENamespace, framework.PlanSecretName)).To(BeEmpty())
+
+		By("Verifying the reconcile does not rewrite lifecycle data after un-cancel")
+		Consistently(func() string {
+			return framework.GetSecretResourceVersion(ctx, cl,
+				framework.E2ENamespace, framework.PlanSecretName)
+		}, 12*time.Second, 3*time.Second).Should(Equal(rvAfterRemove),
+			"monitoring-only reconciles should not rewrite Secret data in this steady state")
 	})
 
 	It("should kill the instruction's whole process tree, not merely its shell", func() {
