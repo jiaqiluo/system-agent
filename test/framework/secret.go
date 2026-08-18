@@ -134,12 +134,11 @@ func CreatePlanSecretWithData(ctx context.Context, cl client.Client, namespace, 
 	return CreatePlanSecretWithAnnotations(ctx, cl, namespace, name, plan, extraData, nil)
 }
 
-// CreatePlanSecretWithAnnotations creates a plan Secret that carries annotations from the moment
-// it exists.
+// CreatePlanSecretWithAnnotations creates the plan Secret with its annotations already set.
 //
-// The interrupt annotations have to be in place before the agent's first reconcile for any spec
-// that asserts a plan never ran at all: setting them after the Create races the apply, and for a
-// plan whose instruction finishes in milliseconds that is a race the spec loses.
+// The interrupt annotations must exist before the agent's first reconcile for any spec that asserts
+// the plan never ran. Adding them after Create races with apply; for instructions that finish in
+// milliseconds, the spec can lose that race.
 func CreatePlanSecretWithAnnotations(ctx context.Context, cl client.Client, namespace, name string, plan []byte,
 	extraData map[string][]byte, annotations map[string]string,
 ) error {
@@ -160,11 +159,11 @@ func CreatePlanSecretWithAnnotations(ctx context.Context, cl client.Client, name
 	return cl.Create(ctx, secret)
 }
 
-// SetSecretAnnotation sets a single annotation on a Secret, creating the annotation map if needed.
+// SetSecretAnnotation sets a single annotation on a Secret, initializing the annotation map if needed.
 //
-// The read-modify-write is retried on conflict because the agent writes to the same object while a
-// plan is in flight: for the interrupt specs a 409 here is the normal path rather than a rare race,
-// since the whole point is to annotate a Secret the agent is actively reconciling.
+// The read-modify-write is retried on conflict because the agent may update the same object while
+// a plan is in flight. For the interrupt specs, a 409 is an expected outcome rather than an
+// exceptional race: the Secret is being annotated while the agent is actively reconciling it.
 func SetSecretAnnotation(ctx context.Context, cl client.Client, namespace, name, key, value string) error {
 	return retry.RetryOnConflict(retry.DefaultBackoff, func() error {
 		secret := &corev1.Secret{}
@@ -179,9 +178,11 @@ func SetSecretAnnotation(ctx context.Context, cl client.Client, namespace, name,
 	})
 }
 
-// RemoveSecretAnnotation deletes a single annotation from a Secret. Removing an annotation and
-// setting it to "false" are indistinguishable to the agent; both release a hold. Retries on
-// conflict for the same reason SetSecretAnnotation does.
+// RemoveSecretAnnotation removes a single annotation from a Secret.
+//
+// Removing the annotation and setting it to "false" have the same effect on the agent: both
+// release the hold. As with SetSecretAnnotation, the update is retried on conflict because the
+// agent may be reconciling the Secret concurrently.
 func RemoveSecretAnnotation(ctx context.Context, cl client.Client, namespace, name, key string) error {
 	return retry.RetryOnConflict(retry.DefaultBackoff, func() error {
 		secret := &corev1.Secret{}
@@ -189,8 +190,6 @@ func RemoveSecretAnnotation(ctx context.Context, cl client.Client, namespace, na
 			return err
 		}
 		if _, ok := secret.Annotations[key]; !ok {
-			// Already absent. Issuing the Update anyway would bump the resourceVersion for no
-			// reason, which the "the agent wrote nothing" specs would then have to explain away.
 			return nil
 		}
 		delete(secret.Annotations, key)
@@ -198,8 +197,8 @@ func RemoveSecretAnnotation(ctx context.Context, cl client.Client, namespace, na
 	})
 }
 
-// GetSecretResourceVersion returns a Secret's resourceVersion, for asserting that the agent wrote
-// nothing over an interval.
+// GetSecretResourceVersion returns a Secret's resourceVersion so callers can verify that the agent
+// did not modify it during an interval.
 func GetSecretResourceVersion(ctx context.Context, cl client.Client, namespace, name string) string {
 	secret := &corev1.Secret{}
 	Expect(cl.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, secret)).
@@ -208,11 +207,7 @@ func GetSecretResourceVersion(ctx context.Context, cl client.Client, namespace, 
 }
 
 // GetPlanProgress retrieves and unmarshals the plan-progress checkpoint from a plan Secret.
-// Returns nil when the key is absent or empty.
-//
-// The checkpoint's JSON keys are checksum, completedInstructions, totalInstructions, resumeState
-// and paused. The last two are omitempty, so a cancellation report — which is never resumed from —
-// carries neither, and callers must treat an absent "paused" as false.
+// It returns nil when the annotation is missing or empty.
 func GetPlanProgress(ctx context.Context, cl client.Client, namespace, name string) map[string]any {
 	data := GetSecretData(ctx, cl, namespace, name)
 	raw, ok := data[k8splan.PlanProgressKey]

@@ -1,5 +1,21 @@
 package k8splan
 
+// This file enforces the plan-state execution invariant:
+//
+// The agent executes a plan only when both PlanPausedAnnotation and PlanCancelledAnnotation are
+// explicitly inactive: absent or set to "false". Any other value suppresses execution, regardless
+// of the plan state, checkpoint, or how the agent reached reconciliation.
+//
+// This is intentionally a whitelist of executable states rather than a blacklist of interrupted
+// states. Unknown values therefore fail closed and suppress execution without requiring an explicit
+// rule for every possible value. This protects against a particularly dangerous failure mode:
+// an interruption appears to work, but the plan executes after the agent restarts.
+//
+// An interrupt suppresses execution, not observation. While either annotation is active, the agent
+// skips Apply but continues running probes and persisting their statuses. This keeps health data
+// current for Rancher's MachineHealthCheck, especially for nodes that may be unhealthy. As a result,
+// handleInterrupt returns only lifecycle-key updates; the caller merges probe statuses into the same map.
+
 import (
 	"context"
 	"errors"
@@ -17,22 +33,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/util/retry"
 )
-
-// This file enforces the plan-state execution invariant:
-//
-// The agent executes a plan only when both PlanPausedAnnotation and PlanCancelledAnnotation are
-// explicitly inactive: absent or set to "false". Any other value suppresses execution, regardless
-// of the plan state, checkpoint, or how the agent reached reconciliation.
-//
-// This is intentionally a whitelist of executable states rather than a blacklist of interrupted
-// states. Unknown values therefore fail closed and suppress execution without requiring an explicit
-// rule for every possible value. This protects against a particularly dangerous failure mode:
-// an interruption appears to work, but the plan executes after the agent restarts.
-//
-// An interrupt suppresses execution, not observation. While either annotation is active, the agent
-// skips Apply but continues running probes and persisting their statuses. This keeps health data
-// current for Rancher's MachineHealthCheck, especially for nodes that may be unhealthy. As a result,
-// handleInterrupt returns only lifecycle-key updates; the caller merges probe statuses into the same map.
 
 // parseInterruptAnnotation reports whether the given annotation requests an interrupt. The only
 // accepted values are "true" and "false"; an absent annotation is treated as "false". Any other
@@ -55,7 +55,7 @@ func parseInterruptAnnotation(annotations map[string]string, key string) (bool, 
 
 // readInterrupt evaluates both interrupt annotations and determines whether the plan should run.
 // The annotations are evaluated in this order:
-//  1. A valid cancelled == "true" takes precedence, even if the pause value is invalid.
+//  1. A valid canceled == "true" takes precedence, even if the pause value is invalid.
 //  2. If cancellation is not active, any invalid annotation value is returned as an error.
 //  3. A valid paused == "true" pauses the plan.
 //  4. Otherwise, the plan may run.
@@ -76,7 +76,8 @@ func readInterrupt(annotations map[string]string) (applyinator.Interruption, err
 }
 
 // interruptPollInterval controls how often the interrupt watch re-reads the plan Secret during an
-// in-flight apply. It is a variable rather than a constant so tests can shorten the interval;
+// in-flight apply.
+// It is a variable rather than a constant so tests can shorten the interval;
 // see withInterruptPollInterval.
 var interruptPollInterval = 2 * time.Second
 

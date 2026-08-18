@@ -329,9 +329,9 @@ func pausePlan(paths pausePaths) *framework.PlanBuilder {
 			[]string{"-c", fmt.Sprintf("echo three >> %s; touch %s", paths.marker, paths.stepThree)}, true)
 }
 
-// pauseAtFirstBoundary delivers plan with plan-state:pending, waits for the first instruction to
-// start, sets the pause annotation, releases the instruction and returns once the agent has
-// recorded the hold. On return plan-state is paused and exactly one instruction has completed.
+// pauseAtFirstBoundary delivers the plan with plan-state:pending, waits for the first instruction
+// to start, sets the pause annotation, releases the instruction, and waits for the agent to record
+// the hold. On return, the plan is paused and exactly one instruction has completed.
 func pauseAtFirstBoundary(ctx context.Context, podName string, paths pausePaths, plan []byte) {
 	GinkgoHelper()
 
@@ -353,10 +353,10 @@ func pauseAtFirstBoundary(ctx context.Context, podName string, paths pausePaths,
 		k8splan.PlanPausedAnnotation, "true")).To(Succeed())
 
 	By("Verifying the pause does not interrupt the instruction already running")
-	// Pause is a boundary, never a kill: it lets the running instruction finish and stops before
-	// the next one. This assertion is also what makes the gate release below deterministic — ten
-	// seconds is comfortably more than the interrupt watch's poll interval, so by the time the
-	// gate opens the agent has certainly observed the annotation.
+	// Pause is a boundary, not a kill: it lets the running instruction finish and stops before the
+	// next one. This assertion also makes the gate release below deterministic - ten seconds is
+	// comfortably longer than the interrupt watch's poll interval, so the agent will have observed
+	// the annotation before the gate opens.
 	Consistently(func() planapi.PlanState { return currentPlanState(ctx) },
 		10*time.Second, 2*time.Second).Should(Equal(planapi.PlanStateInProgress),
 		"a pause must let the running instruction finish rather than interrupt it")
@@ -372,11 +372,11 @@ func pauseAtFirstBoundary(ctx context.Context, podName string, paths pausePaths,
 		framework.WaitTimeout, 2*time.Second)
 }
 
-// deleteAgentPod deletes the agent DaemonSet pod and blocks until the object is actually gone.
+// deleteAgentPod deletes the agent DaemonSet pod and waits until it is actually gone.
 //
-// Waiting matters: KubectlWaitForPodsReady selects on the DaemonSet's label, so returning while
-// the old pod is still Terminating would have it wait for a pod that is never going to be Ready
-// alongside its replacement.
+// Waiting is important because KubectlWaitForPodsReady selects by the DaemonSet's label. If this
+// returns while the old pod is still Terminating, it could wait on a pod that will never become
+// Ready alongside its replacement.
 func deleteAgentPod(ctx context.Context, podName string) {
 	GinkgoHelper()
 
@@ -392,9 +392,9 @@ func deleteAgentPod(ctx context.Context, podName string) {
 		"failed to delete agent pod %s: %s", podName, string(result.Stderr))
 }
 
-// probeStatus returns one probe's recorded status from the plan Secret, or nil when the probe has
-// not been recorded yet. Callers index the result directly; indexing a nil map is safe, and every
-// field of ProbeStatus is omitempty, so an absent key and a zero value are the same thing on the
+// probeStatus returns a probe's recorded status from the plan Secret, or nil if the probe has not
+// been recorded yet. Callers can index the result directly: reading from a nil map is safe, and
+// every ProbeStatus field uses omitempty, so an absent key and a zero value are equivalent on the
 // wire.
 func probeStatus(ctx context.Context, probe string) map[string]any {
 	statuses := framework.GetProbeStatuses(ctx, cl, framework.E2ENamespace, framework.PlanSecretName)

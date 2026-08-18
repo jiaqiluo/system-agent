@@ -15,9 +15,9 @@ import (
 	"github.com/rancher/system-agent/test/framework"
 )
 
-// Node paths used by the cancellation specs. One prefix per spec: the suite's AfterEach deletes
-// the plan Secret but nothing cleans the agent container's filesystem, and a "this file never
-// appeared" assertion that inherits a file from an earlier spec is worse than no assertion at all.
+// Node paths used by the cancellation specs. Each spec gets its own path because AfterEach deletes
+// the plan Secret but does not clean the agent container's filesystem. Without isolated paths, a
+// "this file never appeared" assertion could pass or fail based on artifacts left by an earlier spec.
 const (
 	cancelRunningGate    = "/tmp/e2e-cancel-running-gate"
 	cancelRunningStepTwo = "/tmp/e2e-cancel-running-step-two.txt"
@@ -60,7 +60,7 @@ var _ = Describe("Remote Plan - Cancellation", Label(framework.ShortTestLabel), 
 			k8splan.PlanCancelledAnnotation, "true")).To(Succeed())
 
 		By("Waiting for plan-state to become cancelled")
-		// Cancel is prompt: the in-flight instruction's context is cancelled rather than being
+		// Cancel is prompt: the in-flight instruction's context is canceled rather than being
 		// allowed to finish, so this must not take anything like the instruction's own cap.
 		framework.WaitForSecretFieldCondition(ctx, cl,
 			framework.E2ENamespace, framework.PlanSecretName,
@@ -116,13 +116,13 @@ var _ = Describe("Remote Plan - Cancellation", Label(framework.ShortTestLabel), 
 			framework.WaitTimeout, 2*time.Second)
 
 		By("Verifying the plan's only instruction never runs, across a full re-enqueue cycle")
-		// Sized to outlast interruptedEnqueuePeriod (60s, reconcile.go:24) so this spans at least
-		// one re-enqueue of the cancelled plan. It is the only cancellation coverage of what the
-		// agent does on the reconciles that follow the one that recorded the cancellation, which
-		// is where a missing terminal-state guard would show up.
+		// Sized to outlast interruptedEnqueuePeriod (60s, reconcile.go:24), so this spans at least one
+		// re-enqueue of the canceled plan. This is the only cancellation coverage for reconciles that
+		// follow the one that recorded the cancellation, which is where a missing terminal-state guard
+		// would surface.
 		Consistently(func() bool { return nodeFileExists(ctx, podName, cancelPendingRan) },
 			70*time.Second, 5*time.Second).Should(BeFalse(),
-			"a plan cancelled before it started must have no side effects on the node whatsoever, "+
+			"a plan canceled before it started must have no side effects on the node whatsoever, "+
 				"including on the re-enqueues that follow")
 
 		By("Verifying the checkpoint records that nothing was executed")
@@ -145,21 +145,21 @@ var _ = Describe("Remote Plan - Cancellation", Label(framework.ShortTestLabel), 
 		releaseGateOnCleanup(cancelTreeGate)
 
 		By("Creating a plan whose instruction backgrounds a child that keeps writing")
-		// The backgrounded loop is what the process-group work exists to reach. Plan instructions
-		// are near-universally a run.sh that shells out to an installer or a package manager, so
-		// signalling the direct child alone would leave the real work running on a node whose
-		// operator believes they stopped it.
+		// The backgrounded loop is the process-tree case this test is meant to cover. Plan instructions
+		// almost always run a run.sh that shells out to an installer or package manager, so signaling
+		// only the direct child could leave the actual work running on a node whose operator believes
+		// they stopped it.
 		//
-		// The child's own stdout is redirected to /dev/null so it does not inherit the agent's
-		// pipes. execute() calls eg.Wait() before cmd.Wait(), and eg.Wait() only returns once both
-		// pipes reach EOF, so a child holding them open would keep Apply — and therefore the
-		// agent's single worker — blocked for the child's whole lifetime rather than the parent's.
-		// That is a different failure than the one under test, and it is the watchdog's
-		// pipe-closing logic that covers it, in pkg/applyinator's unit tests.
+		// Redirect the child's stdout to /dev/null so it does not inherit the agent's pipes. execute()
+		// waits for eg.Wait() before cmd.Wait(), and eg.Wait() does not return until both pipes reach EOF.
+		// A child that keeps those pipes open would therefore block Apply and the agent's single worker for
+		// the child's entire lifetime instead of the parent's. That is a separate failure mode from the
+		// one under test; the watchdog's pipe-closing behavior is covered by unit tests in
+		// pkg/applyinator.
 		//
-		// The child watches the gate too, so a cleanup releases the whole tree; its 300-iteration
-		// cap is a backstop against a stray writer and is far beyond the ~90s of assertion windows
-		// below, so it cannot mask a cancel that failed to reach it.
+		// The child also watches the gate, so cleanup can release the entire tree. Its 300-iteration cap
+		// is a backstop against a stray writer and far exceeds the ~90s of assertion windows below, so it
+		// cannot mask a cancellation that failed to reach the child.
 		child := fmt.Sprintf("i=0; while [ ! -e %s ] && [ $i -lt 300 ]; do echo tick >> %s; sleep 1; i=$((i+1)); done",
 			cancelTreeGate, cancelTreeChildLog)
 		script := fmt.Sprintf("(%s) >/dev/null 2>&1 & %s", child, blockingScript(cancelTreeGate))

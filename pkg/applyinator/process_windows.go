@@ -12,36 +12,34 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-// processJob is the per-command Windows state the process-tree helpers share.
+// processJob holds the per-command Windows state shared by the process-tree helpers.
 type processJob struct {
 	handle windows.Handle
-	// assigned records whether the child actually made it into the job. If assignProcessTree
-	// failed the job is empty, and terminating it would kill nothing, so killProcessTree has to
-	// fall back to the direct child instead.
+	// assigned records whether the child was successfully added to the job. If assignment
+	// failed, the job is empty, so killProcessTree must fall back to the direct child.
 	assigned bool
 }
 
-// processJobs holds the Job Object created for each running command, keyed by the *exec.Cmd it was
-// created for. *exec.Cmd has nowhere to carry a platform handle, and the five process-tree helpers
-// have to keep identical signatures on both platforms so that the body of execute stays
-// platform-independent, so the state is parked here for the window between configureProcessGroup
-// and releaseProcessTree.
+// processJobs holds the Job Object created for each running command, keyed by the *exec.Cmd it
+// belongs to. *exec.Cmd has no place for a platform-specific handle, and the process-tree helpers
+// must keep identical signatures on both platforms so execute remains platform-independent. The
+// state therefore lives here for the interval between configureProcessGroup and releaseProcessTree.
 var processJobs sync.Map
 
 // configureProcessGroup creates a Job Object for the command so that everything it spawns can be
-// terminated in one call. It must be called before cmd.Start(), because Windows requires the job to
-// exist before there is a process to assign to it; assignProcessTree does the assignment afterwards.
+// terminated in one call. It must be called before cmd.Start(), because the job must exist before
+// the child can be assigned to it; assignProcessTree performs that assignment afterward.
 //
-// The job exists for exactly one purpose: to give killProcessTree a handle through which
-// TerminateJobObject can reach the whole tree. It deliberately does NOT set
-// JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE. That flag fires when the last handle closes, and
-// releaseProcessTree closes this one at the end of *every* execute, successful ones included -- so
-// setting it would silently stop a Windows instruction from leaving a background process behind,
-// while a Unix one still can. Orphan reaping on the success path is not what this change is for,
-// and the asymmetry would be a Windows-only behaviour change no test in this repo can exercise.
+// The job exists solely to give killProcessTree a handle through which TerminateJobObject can reach
+// the entire process tree. It deliberately does not set JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE.
+// That limit takes effect when the last handle is closed, and releaseProcessTree closes this handle
+// at the end of every execute, including successful executions. Setting it would therefore cause
+// successful Windows instructions to kill any background processes they leave behind, unlike their
+// Unix counterparts. Orphan reaping on the success path is outside the scope of this change, and
+// the resulting Windows-only behavior is not exercised by any test in this repository.
 //
-// Signalling the direct child alone is not enough. Plan instructions are near-universally a script
-// that shells out to an installer or a package manager, and killing the script leaves the real work
+// Signaling only the direct child is not enough. Plan instructions almost always run a script that
+// shells out to an installer or package manager, and killing the script can leave the actual work
 // running.
 func configureProcessGroup(cmd *exec.Cmd) error {
 	job, err := windows.CreateJobObject(nil, nil)
@@ -53,25 +51,25 @@ func configureProcessGroup(cmd *exec.Cmd) error {
 	return nil
 }
 
-// assignProcessTree puts the started child into the Job Object that configureProcessGroup created.
+// assignProcessTree adds the started child to the Job Object created by configureProcessGroup.
 // It must be called after a successful cmd.Start().
 //
-// Accepted caveat: os/exec exposes no pre-Start hook and no handle to the child's primary thread,
-// so the CREATE_SUSPENDED -> assign -> ResumeThread sequence that would close the gap is
-// unavailable. A descendant spawned in the microseconds between cmd.Start() and this call escapes
-// the job and will survive a cancellation. Accepted; out of scope.
+// Accepted caveat: os/exec exposes neither a pre-Start hook nor a handle to the child's primary
+// thread, so the CREATE_SUSPENDED -> assign -> ResumeThread sequence needed to close this gap is
+// unavailable. A descendant spawned between cmd.Start() and this call can therefore escape the
+// job and survive cancellation. This is accepted and out of scope.
 func assignProcessTree(cmd *exec.Cmd) error {
 	job, ok := lookupProcessJob(cmd)
 	if !ok || cmd.Process == nil {
-		// configureProcessGroup failed, or Start never produced a process. Either way there is
-		// nothing to assign, and cancel degrades to the direct-child kill in killProcessTree.
+		// configureProcessGroup failed, or Start produced no process. Either way, there is
+		// nothing to assign, and cancellation falls back to the direct child.
 		return nil
 	}
 
 	var assignErr error
 	// WithHandle rather than OpenProcess(pid): the handle is guaranteed to refer to this process
-	// for the duration of the callback, so it cannot race with pid reuse, and it needs no access
-	// rights of its own.
+	// for the duration of the callback, so it cannot race with pid reuse, and it requires no
+	// additional access rights.
 	if err := cmd.Process.WithHandle(func(handle uintptr) {
 		assignErr = windows.AssignProcessToJobObject(job.handle, windows.Handle(handle))
 	}); err != nil {
@@ -81,21 +79,20 @@ func assignProcessTree(cmd *exec.Cmd) error {
 		return assignErr
 	}
 
-	// Replacing the whole value rather than mutating it in place keeps the sync.Map the only
-	// synchronisation this state needs.
+	// Replace the whole value rather than mutating it in place so sync.Map remains the only
+	// synchronization this state requires.
 	job.assigned = true
 	processJobs.Store(cmd, job)
 	return nil
 }
 
-// terminateProcessTree terminates the command's Job Object, exactly as killProcessTree does.
+// terminateProcessTree terminates the command's Job Object, as killProcessTree does.
 //
-// Accepted caveat: Windows has no SIGTERM. There is no way to ask a process tree to shut down
-// cleanly, so there is nothing a distinct graceful step could do and the instruction is never given
-// the chance to clean up after itself. Cancelling therefore terminates the tree immediately, with
-// no grace period: this is the previously settled "Windows: direct kill" behaviour, widened from
-// the direct child to the whole tree. watchForTermination's grace wait has a process-exit arm, so
-// terminating here short-circuits it rather than stalling on it.
+// Accepted caveat: Windows has no SIGTERM, so there is no graceful signal to send to a process
+// tree. Cancellation therefore terminates the tree immediately, with no grace period. This is the
+// existing "Windows: direct kill" behavior, widened from the direct child to the entire tree.
+// watchForTermination has a process-exit arm, so this immediate termination short-circuits the
+// grace wait rather than leaving it stalled.
 func terminateProcessTree(cmd *exec.Cmd) error {
 	return killProcessTree(cmd)
 }
@@ -106,17 +103,16 @@ func killProcessTree(cmd *exec.Cmd) error {
 		return windows.TerminateJobObject(job.handle, 1)
 	}
 
-	// There is no job, or the child never made it into one, so terminating the job would kill
-	// nothing. Fall back to the direct child so that cancel degrades to a single-process kill
-	// rather than doing nothing at all.
+	// There is no assigned job, so terminating it would do nothing. Fall back to the direct child
+	// so cancellation still terminates the command rather than becoming a no-op.
 	if cmd.Process == nil {
 		return nil
 	}
 	return ignoreProcessGone(cmd.Process.Kill())
 }
 
-// releaseProcessTree closes the command's Job Object handle and forgets it. It is safe to call when
-// no job was ever recorded, and safe to call repeatedly: LoadAndDelete makes the close happen at
+// releaseProcessTree closes the command's Job Object handle and removes its state. It is safe when
+// no job was recorded and safe to call repeatedly: LoadAndDelete ensures the handle is closed at
 // most once.
 func releaseProcessTree(cmd *exec.Cmd) {
 	value, ok := processJobs.LoadAndDelete(cmd)
@@ -141,9 +137,9 @@ func lookupProcessJob(cmd *exec.Cmd) (processJob, bool) {
 	return job, ok
 }
 
-// ignoreProcessGone maps "the process is already gone" onto success. The watchdog races with the
-// instruction exiting under its own power, and a process tree that is already gone is the outcome
-// the caller asked for rather than a failure worth reporting.
+// ignoreProcessGone treats an already-terminated process as success. The watchdog can race with
+// the instruction exiting on its own, and an already-gone process tree means cancellation has
+// achieved its intended outcome rather than producing an error worth reporting.
 func ignoreProcessGone(err error) error {
 	if errors.Is(err, os.ErrProcessDone) {
 		return nil

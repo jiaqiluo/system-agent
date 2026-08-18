@@ -55,7 +55,7 @@ const deleteFileAction = "delete"
 const defaultEffectivePeriod = 600 // 10 minutes
 const defaultFailureCooldown = 6
 
-// instructionTerminationGrace is the time allowed for a cancelled instruction's process tree to
+// instructionTerminationGrace is the time allowed for a canceled instruction's process tree to
 // exit after a graceful termination signal before it is forcefully killed.
 //
 // It is a variable rather than a constant so tests can shorten the interval and exercise the
@@ -199,7 +199,7 @@ func (a *Applyinator) Apply(ctx context.Context, input ApplyInput) (ApplyOutput,
 			case <-input.Cancel:
 				cancelExec()
 			case <-execCtx.Done():
-				// Apply returned (or ctx was cancelled); exit so this goroutine cannot leak.
+				// Apply returned (or ctx was canceled); exit so this goroutine cannot leak.
 			}
 		}()
 	}
@@ -770,8 +770,8 @@ func (a *Applyinator) execute(ctx context.Context, prefix, executionDir string, 
 	})
 
 	if err := cmd.Start(); err != nil {
-		// The watchdog is not running yet, so release any process-tree handle created during setup.
-		// releaseProcessTree is idempotent and is a no-op when no handle was recorded.
+		// The watchdog has not started yet, so release any process-tree handle created during setup.
+		// releaseProcessTree is idempotent and does nothing if no handle was recorded.
 		releaseProcessTree(cmd)
 		return nil, nil, -1, err
 	}
@@ -804,15 +804,15 @@ func (a *Applyinator) execute(ctx context.Context, prefix, executionDir string, 
 }
 
 // watchForTermination monitors ctx and terminates cmd's process tree when cancellation occurs.
-// It sends a graceful termination signal first, then force-kills the tree if it has not exited
-// within instructionTerminationGrace. The pipes are closed only after forced termination so
+// It first sends a graceful termination signal, then force-kills the tree if it has not exited
+// within instructionTerminationGrace. Pipes are closed only after forced termination so that
 // streamLogs cannot remain blocked on descendants that inherited the pipe handles.
 //
 // The returned function stops the watchdog and releases any platform-specific process-tree
 // handles. Callers must defer it.
 func watchForTermination(ctx context.Context, cmd *exec.Cmd, pipes ...io.Closer) func() {
 	// done is closed by the returned stop function; finished is closed when the watchdog exits.
-	// Waiting for finished ensures no termination work remains before process-tree handles are
+	// Waiting for finished ensures all termination work is complete before process-tree handles are
 	// released.
 	done := make(chan struct{})
 	finished := make(chan struct{})
@@ -837,10 +837,10 @@ func watchForTermination(ctx context.Context, cmd *exec.Cmd, pipes ...io.Closer)
 			logrus.Warnf("[applyinator] error terminating the process tree of pid %d: %v", pid, err)
 		}
 
-		// Wait for either the process to finish or the grace period to expire. execute defers
-		// stop(), which closes done after cmd.Wait() returns, so a process that exits promptly
-		// avoids the full grace period. This also handles platforms where terminateProcessTree
-		// kills the tree immediately, such as Windows where no graceful signal is available.
+		// Wait for either the process to finish or the grace period to expire. execute defers stop(),
+		// which closes done after cmd.Wait() returns, so a process that exits promptly avoids waiting
+		// out the full grace period. This also handles platforms where terminateProcessTree kills the
+		// tree immediately, such as Windows, where no graceful signal is available.
 		select {
 		case <-done:
 			// The tree is gone: either it took the hint, or terminateProcessTree killed it outright.
@@ -853,11 +853,11 @@ func watchForTermination(ctx context.Context, cmd *exec.Cmd, pipes ...io.Closer)
 			logrus.Warnf("[applyinator] error killing the process tree of pid %d: %v", pid, err)
 		}
 
-		// execute waits for both output streams to reach EOF before calling cmd.Wait(). A
-		// descendant that inherited a pipe can keep those streams open even after the main process
-		// is killed, so close the pipes explicitly to unblock streamLogs. Do this only on the
-		// forced-kill path so output from a gracefully exiting instruction is not truncated.
-		// Close errors are ignored because cmd.Wait() may close the same descriptors afterward.
+		// execute waits for both output streams to reach EOF before calling cmd.Wait(). A descendant
+		// that inherited a pipe can keep the streams open even after the main process is killed, so close
+		// the pipes explicitly to unblock streamLogs. Only do this on the forced-kill path, so output from
+		// a gracefully exiting instruction is not truncated. Ignore close errors because cmd.Wait() may
+		// close the same descriptors afterward.
 		for _, pipe := range pipes {
 			_ = pipe.Close()
 		}
