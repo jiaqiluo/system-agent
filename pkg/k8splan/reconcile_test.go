@@ -1566,12 +1566,12 @@ func TestReconcileSecretCancelledTerminalPlanMonitorsOnly(t *testing.T) {
 		t.Fatalf("reconcileSecret returned error: %v", err)
 	}
 
-	assertPathAbsent(t, periodicSentinel, "a cancelled terminal plan should be monitored only")
+	assertPathAbsent(t, periodicSentinel, "a canceled terminal plan should be monitored only")
 	if got := planapi.PlanState(result.Data[planapi.PlanStateKey]); got != planapi.PlanStateCancelled {
 		t.Errorf("expected plan-state to remain %q, got %q", planapi.PlanStateCancelled, got)
 	}
 	if got := string(result.Data[AppliedChecksumKey]); got != "" {
-		t.Errorf("expected applied-checksum to remain empty for a cancelled plan, got %q", got)
+		t.Errorf("expected applied-checksum to remain empty for a canceled plan, got %q", got)
 	}
 	if !bytes.Equal(result.Data[PlanProgressKey], cancelReport) {
 		t.Errorf("expected cancellation report to be preserved, got %q want %q", result.Data[PlanProgressKey], cancelReport)
@@ -1647,8 +1647,8 @@ func TestReconcileSecretFailedTerminalPlanMonitorsOnly(t *testing.T) {
 //
 // The window is real, not theoretical. A succeeded plan is reconciled forever: it still runs its
 // periodic instructions on every pass, so an apply is in flight for part of every cycle even
-// though needsApplied is false. Without the guard the same `kubectl annotate cancelled=true` on
-// the same node yields "succeeded" (untouched) when it lands at reconcile entry and "cancelled"
+// though needsApplied is false. Without the guard the same `kubectl annotate canceled=true` on
+// the same node yields "succeeded" (untouched) when it lands at reconcile entry and "canceled"
 // when it lands during that periodic apply — a coin flip decided by which side of a 2s poll the
 // operator's write falls on. Cancel is terminal, so the losing side of that flip is permanent.
 //

@@ -29,7 +29,7 @@ import (
 // The property under test:
 //
 //	In the plan-state flow, the agent executes a plan only when both plan.cattle.io/paused and
-//	plan.cattle.io/cancelled are unambiguously not set — absent, or present with the value
+//	plan.cattle.io/canceled are unambiguously not set — absent, or present with the value
 //	"false". Anything else stops execution. No matter what plan-state says, no matter what the
 //	checkpoint says, no matter how the agent arrived at this reconcile.
 //
@@ -219,7 +219,7 @@ func suppressionMatrix() []suppressionRow {
 		{
 			// A cancel report carries Paused: false, so it is NOT an already-recorded suspension:
 			// the pause is recorded on top of it, keeping the report's Completed.
-			name:           "cancelled with a cancel report: a report is not a suspension",
+			name:           "canceled with a cancel report: a report is not a suspension",
 			planState:      planapi.PlanStateCancelled,
 			checkpoint:     &planProgress{Completed: 2, Total: 3},
 			wantUpdates:    1,
@@ -231,13 +231,13 @@ func suppressionMatrix() []suppressionRow {
 			// the checkpoint: cancel writes no resumable checkpoint to key off.
 			//
 			// A SUCCEEDED plan the operator then cancels, deliberately, rather than an
-			// already-cancelled one. On an already-cancelled plan the write the guard suppresses
+			// already-canceled one. On an already-canceled plan the write the guard suppresses
 			// would be byte-identical to what is already stored, so writeInterruptOutcome's
 			// DeepEqual would skip the Update whether the guard fired or not and the row would be
 			// blind to it. Here the suppressed write would move plan-state from succeeded to
-			// cancelled, so the guard's absence is visible. Not reachable from any
+			// canceled, so the guard's absence is visible. Not reachable from any
 			// paused-annotation row, so the row carries its own annotation.
-			name:        "succeeded then cancelled: cancel's write-once guard keys off the terminal plan-state",
+			name:        "succeeded then canceled: cancel's write-once guard keys off the terminal plan-state",
 			annotation:  PlanCanceledAnnotation,
 			planState:   planapi.PlanStateSucceeded,
 			checkpoint:  &planProgress{Completed: 2, Total: 3},
@@ -577,7 +577,7 @@ func TestRestartThenUnpauseResumesAtTheCheckpoint(t *testing.T) {
 }
 
 // TestOnlyASuspendedCheckpointGrantsAResume pins the sole gate on a checkpoint's Completed being
-// honored: planProgress.Paused. A Paused: false record is a REPORT — of how far a cancelled plan
+// honored: planProgress.Paused. A Paused: false record is a REPORT — of how far a canceled plan
 // got, or of where a resume commit released a plan — and a report must never position an apply.
 //
 // The two rows are the two distinct returns resolveResume can take to reach that answer, and each
@@ -608,7 +608,7 @@ func TestOnlyASuspendedCheckpointGrantsAResume(t *testing.T) {
 		},
 		{
 			// A cancel report on a plan someone then paused and unpaused. The report records how
-			// far the cancelled plan got; mistaking it for a resume point would skip real work.
+			// far the canceled plan got; mistaking it for a resume point would skip real work.
 			name:      "paused under a cancel report: a report is never mistaken for a resume point",
 			planState: PlanStatePaused,
 		},

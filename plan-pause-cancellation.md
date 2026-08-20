@@ -3,7 +3,7 @@
 ## Context
 
 `github.com/rancher/rancher/pkg/plan` now models an explicit plan lifecycle
-(`pending` → `in-progress` → `succeeded` | `failed` | `cancelled`), and the agent already drives
+(`pending` → `in-progress` → `succeeded` | `failed` | `canceled`), and the agent already drives
 those transitions in `pkg/k8splan/reconcile.go`. Two lifecycle controls are still missing on the
 node side:
 
@@ -13,7 +13,7 @@ node side:
 - **Pause** — an operator needs to hold execution at an instruction boundary (maintenance window,
   incident) and later resume from where it stopped rather than re-running the whole plan.
 
-Both are signaled by annotations on the plan Secret (`plan.cattle.io/cancelled: "true"`,
+Both are signaled by annotations on the plan Secret (`plan.cattle.io/canceled: "true"`,
 `plan.cattle.io/paused: "true"`; the only other valid value is `"false"`, and anything else is an
 error the operator has to correct). The hard part is that `Applyinator.Apply` runs synchronously
 inside the `OnChange` handler with `DefaultWorkers: 1`, so while an apply is in flight the
@@ -75,7 +75,7 @@ New constants in `pkg/k8splan/watcher.go`:
 // PlanCanceledAnnotation, set to "true" on the plan Secret, requests that the agent abort the plan.
 // Removing it does not un-cancel: the plan is terminal and waits for new content.
 // The only valid values are "true" and "false"; see readInterrupt.
-PlanCanceledAnnotation = "plan.cattle.io/cancelled"
+PlanCanceledAnnotation = "plan.cattle.io/canceled"
 // PlanPausedAnnotation, set to "true" on the plan Secret, requests that the agent hold execution.
 // While it is set the agent executes nothing for this plan, whatever plan-state or the resume
 // checkpoint say; clearing it is the only thing that resumes the plan.
@@ -178,7 +178,7 @@ instructions of a single apply; see "Remaining risks" item 4 for where it stops 
 ### The suppression invariant
 
 > **In the plan-state flow, the agent executes a plan only when both `plan.cattle.io/paused` and
-> `plan.cattle.io/cancelled` are unambiguously not set — absent, or present with the value
+> `plan.cattle.io/canceled` are unambiguously not set — absent, or present with the value
 > `"false"`. Anything else stops execution. Full stop — no matter what `plan-state` says, no matter
 > what the checkpoint says, no matter how the agent arrived at this reconcile.**
 
@@ -254,7 +254,7 @@ machinery on a plan that was never attempted.
 
 One exception, and it is the emergency-stop one. Precedence is:
 
-1. `plan.cattle.io/cancelled == "true"` → **cancel**, even if the other annotation's value is
+1. `plan.cattle.io/canceled == "true"` → **cancel**, even if the other annotation's value is
    invalid. An operator stopping a runaway installer is not made to fix a typo on an unrelated
    annotation first. The invalid value is still logged.
 2. Otherwise, either value invalid → the error path above.
@@ -289,7 +289,7 @@ point the plan is either held (and observed) or running.
 
 On top of that:
 
-- **Cancel wins over pause.** If the effective state is non-terminal, write `plan-state: cancelled`
+- **Cancel wins over pause.** If the effective state is non-terminal, write `plan-state: canceled`
   plus a `plan-progress` record. If it is already terminal, log at debug and write nothing.
 - **Pause writes `plan-state: paused`** and a `plan-progress` record. Only in the plan-state flow —
   see below.
@@ -300,7 +300,7 @@ On top of that:
   checkpoint that had just recorded real progress.
 
   "Already recorded" is read from the **checkpoint**, not from `plan-state`: `plan-progress.Paused`
-  for pause, `plan-state == cancelled` for cancel. The checkpoint is the thing that must not be
+  for pause, `plan-state == canceled` for cancel. The checkpoint is the thing that must not be
   recomputed, so it is also the thing to test; and it is strictly the more precise signal, because
   `plan-state == paused` with no checkpoint beneath it is a state the guard must *not* suppress —
   there is a suspension to record for the first time. Cancel keys off `plan-state` because it
@@ -452,7 +452,7 @@ comparison yields `InSync = false`. **Writing `paused` is safe against today's s
 Three consequences follow, and they are properties of the *existing* server rather than of this
 change:
 
-1. **`cancelled` is in the same default branch.** `PlanStateCancelled` is declared in
+1. **`canceled` is in the same default branch.** `PlanStateCancelled` is declared in
    `pkg/plan/state.go:38` and has no `case` anywhere in the planner — it is a dead constant today.
    A canceled plan is therefore also evaluated by checksum and also reports `InSync = false`.
 2. **The planner will not fight a pause.** `UpdatePlan` — the only writer of `plan-state: pending`
@@ -480,7 +480,7 @@ treatment if it supersedes the CAPR path as its doc comment anticipates.
 
 Rancher installs and upgrades the agent, so an upgraded Rancher will deliver plans to nodes still
 running the previous agent for the length of the rolling agent upgrade. If such a plan carries
-`plan.cattle.io/paused` or `plan.cattle.io/cancelled`, what does the old agent do? Checked against
+`plan.cattle.io/paused` or `plan.cattle.io/canceled`, what does the old agent do? Checked against
 this repository at `HEAD` (the last release before this change):
 
 1. **It never reads annotations.** `grep -rn "Annotation" pkg/ main.go`, excluding tests, returns
@@ -566,7 +566,7 @@ are shipping decisions rather than runtime ones:
 
 | Failure discovered              | Response                                                                     | What still works                                                                    |
 |---------------------------------|------------------------------------------------------------------------------|-------------------------------------------------------------------------------------|
-| Planner mishandles `cancelled`  | Do not ship cancel; pause is independent of it                               | Pause, checkpoint, resume                                                           |
+| Planner mishandles `canceled`  | Do not ship cancel; pause is independent of it                               | Pause, checkpoint, resume                                                           |
 | Checkpointing itself is unsound | Ship cancel only, or set `ResumeFromOneTimeInstruction` to 0 unconditionally | Pause degrades to "suppress and re-run from the start" — the checksum-flow semantic |
 
 Neither requires reverting the applyinator work: the interruption points, the process-tree kill and
@@ -620,7 +620,7 @@ func watchForTermination(ctx context.Context, cmd *exec.Cmd, pipes ...io.Closer)
 Signaling the **direct child only** is not sufficient, and this is promoted from a follow-up to
 part of the change. Plan instructions are near-universally a `run.sh` that shells out to an
 installer, a package manager or `systemctl`; SIGTERM to the shell leaves the real work running.
-Reporting `plan-state: cancelled` while the operation the operator wanted stopped is still running
+Reporting `plan-state: canceled` while the operation the operator wanted stopped is still running
 is the worst available outcome for a safety control, so cancel must target the tree.
 
 New `pkg/applyinator/process_unix.go` (`//go:build !windows`) and `process_windows.go`, matching the
@@ -678,7 +678,7 @@ New `pkg/k8splan/interrupt.go`:
   ```
 
   `readInterrupt` calls it for both keys and applies the precedence from "Invalid annotation values":
-  a valid `cancelled == "true"` returns `InterruptionCanceled` with a nil error even when the pause
+  a valid `canceled == "true"` returns `InterruptionCanceled` with a nil error even when the pause
   value is invalid; otherwise any error is returned and the `Interruption` is meaningless to the
   caller; otherwise a valid `paused == "true"` returns `InterruptionPaused`; otherwise
   `InterruptionNone`. Errors from both keys are joined with `errors.Join` so a doubly-mistyped
@@ -733,7 +733,7 @@ And the conflict is not a rare race — it is the normal path. The operator's an
 the Secret's resourceVersion while the agent holds a copy read before the apply started, so the
 outcome `Update` is guaranteed to 409. Consequences under the original design:
 
-- Cancel self-heals by crashing: the agent exits, restarts, and eventually writes `cancelled` from
+- Cancel self-heals by crashing: the agent exits, restarts, and eventually writes `canceled` from
   a fresh object.
 - Pause does not: the `plan-progress` checkpoint and the accumulated `applied-output` are lost, so
   unpause re-runs from instruction 0 — silently defeating the feature.
@@ -806,7 +806,7 @@ outcome `Update` is guaranteed to 409. Consequences under the original design:
 7. If `applyOutput.Interruption != InterruptionNone`, take the interrupted outcome path instead of
    `buildSecretDataUpdates` (which would otherwise write `plan-state: failed`, since an interrupted
    apply has `OneTimeApplySucceeded == false`):
-   - `plan-state` = `cancelled`/`paused` and the `plan-progress` checkpoint, per the ResumeState
+   - `plan-state` = `canceled`/`paused` and the `plan-progress` checkpoint, per the ResumeState
      table (this path is plan-state flow only),
    - `applied-output` with the accumulated one-time output — this is what `selectExistingOutput`
      feeds back as `ExistingOneTimeOutput`, so `SaveOutput` results from already-completed
@@ -828,7 +828,7 @@ every node for the whole duration of a pause to no purpose.
 
 `plan_decision.go`: **no changes.** The original design added a `Halt` flag on `planStateResult` for
 `PlanStateCancelled` and a defensive `PlanStatePaused` case. Neither is needed once interrupts
-preserve observation: `cancelled` falls through the existing terminal default branch to
+preserve observation: `canceled` falls through the existing terminal default branch to
 `NeedsApplied: false`, and `paused` is resolved to its `ResumeState` before the function is
 reached.
 
@@ -850,7 +850,7 @@ today's Rancher — verified" above. What is left is not verifiable by reading c
    that Rancher change; pause has no such dependency.
 
    **Release gate:** do not expose cancel through UI/API defaults until "Proposed changes in
-   rancher/rancher" item 5 (re-drive from `cancelled` when the annotation is cleared) has landed.
+   rancher/rancher" item 5 (re-drive from `canceled` when the annotation is cleared) has landed.
 2. **MachineHealthCheck interaction.** Keeping probes running on a canceled plan is the right
    default, but a node left in a partial state will start reporting unhealthy and may be
    remediated. Confirm that is the desired behavior with whoever owns the MHC configuration.
@@ -897,7 +897,7 @@ PlanStatePaused PlanState = "paused"
 // PlanCanceledAnnotation / PlanPausedAnnotation request that the agent abort or hold the plan.
 // The only valid values are "true" and "false"; an absent annotation is "false". The agent rejects
 // anything else rather than guessing, so producers must not write other spellings.
-PlanCanceledAnnotation = "plan.cattle.io/cancelled"
+PlanCanceledAnnotation = "plan.cattle.io/canceled"
 PlanPausedAnnotation    = "plan.cattle.io/paused"
 
 // PlanProgressKey is the Secret data key holding the agent's resume checkpoint.
@@ -949,7 +949,7 @@ the UI and `kubectl describe machine` read, and it is where an operator will act
 
 Without this, cancel strands the machine. The existing guard re-drives a plan only when
 `!store.equalities.DeepEqual(entry.Plan.Plan, newPlan)`. Widen it: when the cancel annotation has
-been removed and `plan-state` is still `cancelled`, call `UpdatePlan` to rewrite
+been removed and `plan-state` is still `canceled`, call `UpdatePlan` to rewrite
 `plan-state: pending` even though the plan bytes are unchanged, so the operator's act of clearing
 the annotation is what re-arms the node:
 
@@ -962,7 +962,7 @@ if entry.Plan.PlanState == planapi.PlanStateCancelled && (!ok || v == "false") {
 
 Two properties worth stating explicitly in review, because they are the whole risk of this item:
 re-arming must be driven by the *annotation transition* and not by the mere presence of
-`cancelled`, or the planner will immediately undo every cancellation; and the agent re-runs the
+`canceled`, or the planner will immediately undo every cancellation; and the agent re-runs the
 plan from instruction 0, since a canceled plan keeps no checkpoint. The alternative — require a
 plan content change — is simpler and needs no code, but leaves the operator with no obvious action
 to take.
@@ -1085,7 +1085,7 @@ is cosmetic and can land whenever.
 `pkg/k8splan/interrupt_test.go`, `readInterrupt` table — the accepted set and the precedence rules,
 asserting the returned `Interruption` *and* whether an error came back:
 
-| `cancelled` | `paused`  | result                                                        |
+| `canceled` | `paused`  | result                                                        |
 |-------------|-----------|---------------------------------------------------------------|
 | absent      | absent    | `InterruptionNone`, nil                                       |
 | `"false"`   | `"false"` | `InterruptionNone`, nil — the explicit-false form             |
@@ -1130,7 +1130,7 @@ every row that **`Apply` is never called** and no instruction sentinel file appe
 | `pending`              | absent                          | a plan delivered already paused                                |
 | `succeeded`            | absent                          | terminal; nothing to suppress, asserts no regression           |
 | absent (checksum flow) | absent                          | baseline legacy behavior with no annotation influence          |
-| `cancelled`            | `Paused: false`, `Completed: 2` | a cancel report is not a suspension                            |
+| `canceled`            | `Paused: false`, `Completed: 2` | a cancel report is not a suspension                            |
 
 All plan-state-flow rows carry `plan.cattle.io/paused: "true"`. The checksum-flow row is run as a
 separate baseline fixture (annotation absent), because checksum flow ignores annotations by design.
@@ -1186,7 +1186,7 @@ Plus one for the exit path itself:
 Four cases exist specifically for the defects this revision fixes, and should be written first:
 
 - **Checksum-flow annotation is ignored — entry path.** No `plan-state` on the input Secret,
-  annotation set (`paused` or `cancelled`). Assert a warn log is emitted on every reconcile and
+  annotation set (`paused` or `canceled`). Assert a warn log is emitted on every reconcile and
   reconcile follows
   ordinary checksum behavior (including normal apply decision based on checksum), with no
   `plan-state`/`plan-progress` writes. Assert warning text includes checksum-flow context plus
@@ -1222,7 +1222,7 @@ behaviour.
   is recorded. Cheap, and it is the one assertion that catches a real API server behaving
   differently from the fake client on "the agent wrote nothing".
 - `cancellation_test.go`: cancel a plan whose first instruction sleeps → `plan-state` reaches
-  `cancelled`, the later instruction's file never appears, `plan-progress` shows partial execution;
+  `canceled`, the later instruction's file never appears, `plan-progress` shows partial execution;
   cancel a pending plan → no side effects at all.
 - `pause_test.go`: pause between instructions → `plan-state: paused` and the next instruction's
   file is absent; remove the annotation → `plan-state: succeeded` and an append-once marker file

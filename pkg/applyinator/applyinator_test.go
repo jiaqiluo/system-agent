@@ -136,7 +136,7 @@ func TestAppliedPlanRetentionPolicy(t *testing.T) {
 }
 
 // TestExecuteCapturesStdoutStderrAndExitCode is also the happy-path guard for the termination
-// watchdog execute arms on every command: a command that is never cancelled must have its output
+// watchdog execute arms on every command: a command that is never canceled must have its output
 // captured in full and its exit code reported unchanged, so the watchdog neither truncates output
 // by closing the pipes early nor interferes with exit reporting.
 func TestExecuteCapturesStdoutStderrAndExitCode(t *testing.T) {
@@ -1309,7 +1309,7 @@ func TestApplyPreClosedCancelShortCircuitsBeforeTheLock(t *testing.T) {
 	if output.CompletedOneTimeInstructions != 3 {
 		t.Errorf("expected the incoming checkpoint (3) to be reported unchanged, got %d", output.CompletedOneTimeInstructions)
 	}
-	assertPathAbsent(t, sentinel, "no instruction may run once the apply is already cancelled")
+	assertPathAbsent(t, sentinel, "no instruction may run once the apply is already canceled")
 }
 
 func TestApplyPauseStopsBeforeTheNextInstruction(t *testing.T) {
@@ -1527,7 +1527,7 @@ func TestApplyCancelDuringLongRunningInstructionReturnsPromptly(t *testing.T) {
 	// A killed instruction is still a failed instruction, so OneTimeApplySucceeded is false here.
 	// "A cancel-induced kill must not be reported as a plan failure" is therefore an obligation on
 	// the caller: it has to test Interruption BEFORE OneTimeApplySucceeded, or it will record a
-	// cancelled plan as failed. Pinned so the downstream reconcile task can rely on this ordering.
+	// canceled plan as failed. Pinned so the downstream reconcile task can rely on this ordering.
 	if output.OneTimeApplySucceeded {
 		t.Error("expected OneTimeApplySucceeded=false for a cancel-killed instruction; callers must check Interruption first")
 	}
@@ -1734,7 +1734,7 @@ func TestApplyPauseDuringPeriodicInstructionsIsReported(t *testing.T) {
 }
 
 // assertFileStopsGrowing samples path's size and fails as soon as it grows during window. Used to
-// prove a backgrounded descendant of a cancelled instruction is really dead rather than orphaned:
+// prove a backgrounded descendant of a canceled instruction is really dead rather than orphaned:
 // a fixed wait followed by a single comparison would prove the same thing, but this reports the
 // failure the moment it happens instead of always burning the whole window.
 func assertFileStopsGrowing(t *testing.T, path string, window time.Duration) {
@@ -1751,8 +1751,8 @@ func assertFileStopsGrowing(t *testing.T, path string, window time.Duration) {
 			t.Fatalf("stat %s: %v", path, err)
 		}
 		if current.Size() != initial.Size() {
-			t.Fatalf("expected %s to stop growing once the instruction was cancelled, but it grew from %d to %d bytes: "+
-				"a descendant of the cancelled instruction is still running", path, initial.Size(), current.Size())
+			t.Fatalf("expected %s to stop growing once the instruction was canceled, but it grew from %d to %d bytes: "+
+				"a descendant of the canceled instruction is still running", path, initial.Size(), current.Size())
 		}
 	}
 }
@@ -1879,7 +1879,7 @@ func (r *recordingCloser) state() (int, time.Time) {
 // func.
 //
 // It does not return until the trap is demonstrably installed. cmd.Start() returns as soon as
-// fork/exec succeeds, well before sh has parsed the trap, so a test that cancelled immediately
+// fork/exec succeeds, well before sh has parsed the trap, so a test that canceled immediately
 // would signal a shell still running the *default* SIGTERM disposition: it would die instantly and
 // every case would silently observe the graceful path, whichever handler it asked for.
 func startWatchedCommand(t *testing.T, trapAction string) (context.CancelFunc, *recordingCloser, <-chan error, func()) {
@@ -1935,7 +1935,7 @@ func withTerminationGrace(t *testing.T, d time.Duration) {
 }
 
 // TestWatchForTerminationClosesThePipesOnlyWhenItEscalates pins both halves of the watchdog's pipe
-// handling, which is the one part of it a cancelled Apply cannot observe: on Unix the graceful
+// handling, which is the one part of it a canceled Apply cannot observe: on Unix the graceful
 // SIGTERM already reaches the whole process group, so the pipes reach EOF on their own and closing
 // them explicitly makes no observable difference at the Apply level.
 //

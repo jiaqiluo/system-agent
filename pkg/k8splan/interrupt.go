@@ -60,10 +60,10 @@ func parseInterruptAnnotation(annotations map[string]string, key string) (bool, 
 //  3. A valid paused == "true" pauses the plan.
 //  4. Otherwise, the plan may run.
 func readInterrupt(annotations map[string]string) (applyinator.Interruption, error) {
-	cancelled, cancelErr := parseInterruptAnnotation(annotations, PlanCanceledAnnotation)
+	canceled, cancelErr := parseInterruptAnnotation(annotations, PlanCanceledAnnotation)
 	paused, pauseErr := parseInterruptAnnotation(annotations, PlanPausedAnnotation)
 
-	if cancelErr == nil && cancelled {
+	if cancelErr == nil && canceled {
 		return applyinator.InterruptionCanceled, nil
 	}
 	if cancelErr != nil || pauseErr != nil {

@@ -25,12 +25,12 @@ import (
 // from a present-but-empty value: the latter is a configuration error, the former is "false".
 const absentAnnotation = "\x00absent"
 
-// interruptAnnotations renders a cancelled/paused pair into an annotation map, omitting either key
+// interruptAnnotations renders a canceled/paused pair into an annotation map, omitting either key
 // whose value is absentAnnotation.
-func interruptAnnotations(cancelled, paused string) map[string]string {
+func interruptAnnotations(canceled, paused string) map[string]string {
 	annotations := map[string]string{}
-	if cancelled != absentAnnotation {
-		annotations[PlanCanceledAnnotation] = cancelled
+	if canceled != absentAnnotation {
+		annotations[PlanCanceledAnnotation] = canceled
 	}
 	if paused != absentAnnotation {
 		annotations[PlanPausedAnnotation] = paused
@@ -109,68 +109,68 @@ func TestReadInterrupt(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name      string
-		cancelled string
-		paused    string
-		want      applyinator.Interruption
-		wantErr   bool
+		name     string
+		canceled string
+		paused   string
+		want     applyinator.Interruption
+		wantErr  bool
 		// wantErrMentions are substrings the joined error must contain.
 		wantErrMentions []string
 	}{
 		{
-			name:      "neither annotation is set: the plan may run",
-			cancelled: absentAnnotation, paused: absentAnnotation,
+			name:     "neither annotation is set: the plan may run",
+			canceled: absentAnnotation, paused: absentAnnotation,
 			want: applyinator.InterruptionNone,
 		},
 		{
-			name:      "both annotations explicitly false: the plan may run",
-			cancelled: "false", paused: "false",
+			name:     "both annotations explicitly false: the plan may run",
+			canceled: "false", paused: "false",
 			want: applyinator.InterruptionNone,
 		},
 		{
-			name:      "paused alone holds the plan",
-			cancelled: absentAnnotation, paused: "true",
+			name:     "paused alone holds the plan",
+			canceled: absentAnnotation, paused: "true",
 			want: applyinator.InterruptionPaused,
 		},
 		{
-			name:      "cancelled alone cancels the plan",
-			cancelled: "true", paused: absentAnnotation,
+			name:     "canceled alone cancels the plan",
+			canceled: "true", paused: absentAnnotation,
 			want: applyinator.InterruptionCanceled,
 		},
 		{
-			name:      "cancel wins when both are set",
-			cancelled: "true", paused: "true",
+			name:     "cancel wins when both are set",
+			canceled: "true", paused: "true",
 			want: applyinator.InterruptionCanceled,
 		},
 		{
-			name:      "a valid cancel is never blocked by an invalid pause value",
-			cancelled: "true", paused: "yes",
+			name:     "a valid cancel is never blocked by an invalid pause value",
+			canceled: "true", paused: "yes",
 			want: applyinator.InterruptionCanceled,
 		},
 		{
-			name:      "a capitalised cancel value is a configuration error, not a cancellation",
-			cancelled: "True", paused: absentAnnotation,
+			name:     "a capitalised cancel value is a configuration error, not a cancellation",
+			canceled: "True", paused: absentAnnotation,
 			want: applyinator.InterruptionNone, wantErr: true,
 		},
 		{
-			name:      "a ParseBool-style cancel value is a configuration error, not a cancellation",
-			cancelled: "1", paused: absentAnnotation,
+			name:     "a ParseBool-style cancel value is a configuration error, not a cancellation",
+			canceled: "1", paused: absentAnnotation,
 			want: applyinator.InterruptionNone, wantErr: true,
 		},
 		{
-			name:      "a present but empty pause value is a configuration error, not an absent annotation",
-			cancelled: absentAnnotation, paused: "",
+			name:     "a present but empty pause value is a configuration error, not an absent annotation",
+			canceled: absentAnnotation, paused: "",
 			want: applyinator.InterruptionNone, wantErr: true,
 		},
 		{
-			name:      "both values invalid: one joined error naming both keys",
-			cancelled: "maybe", paused: "nope",
+			name:     "both values invalid: one joined error naming both keys",
+			canceled: "maybe", paused: "nope",
 			want: applyinator.InterruptionNone, wantErr: true,
 			wantErrMentions: []string{PlanCanceledAnnotation, PlanPausedAnnotation},
 		},
 		{
-			name:      "an invalid cancel value does not let a valid pause take effect",
-			cancelled: "nope", paused: "true",
+			name:     "an invalid cancel value does not let a valid pause take effect",
+			canceled: "nope", paused: "true",
 			want: applyinator.InterruptionNone, wantErr: true,
 		},
 	}
@@ -179,7 +179,7 @@ func TestReadInterrupt(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			got, err := readInterrupt(interruptAnnotations(tt.cancelled, tt.paused))
+			got, err := readInterrupt(interruptAnnotations(tt.canceled, tt.paused))
 			if (err != nil) != tt.wantErr {
 				t.Fatalf("readInterrupt returned error %v, wantErr %t", err, tt.wantErr)
 			}
@@ -286,7 +286,7 @@ func TestHandleInterrupt(t *testing.T) {
 			wantInMessage: "not recording the cancellation", wantLevel: decisionDebug,
 		},
 		{
-			name:      "cancelling an already cancelled plan writes nothing: the write-once rule",
+			name:      "cancelling an already canceled plan writes nothing: the write-once rule",
 			interrupt: applyinator.InterruptionCanceled, currentPlanState: planapi.PlanStateCancelled, total: 4,
 			data:          progressData(planProgress{Checksum: progressChecksum, Completed: 3, Total: 4}),
 			wantEmpty:     true,
@@ -662,7 +662,7 @@ func TestStartInterruptWatchStopsOnContextCancellation(t *testing.T) {
 	settled := seq.served()
 	time.Sleep(50 * time.Millisecond)
 	if got := seq.served(); got != settled {
-		t.Errorf("the watch served %d more polls after its context was cancelled", got-settled)
+		t.Errorf("the watch served %d more polls after its context was canceled", got-settled)
 	}
 
 	// And stop() must still return promptly on an already-exited goroutine.
@@ -674,7 +674,7 @@ func TestStartInterruptWatchStopsOnContextCancellation(t *testing.T) {
 	select {
 	case <-returned:
 	case <-time.After(10 * time.Second):
-		t.Fatal("stop() hung after the context was cancelled")
+		t.Fatal("stop() hung after the context was canceled")
 	}
 }
 

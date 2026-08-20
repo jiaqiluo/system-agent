@@ -832,7 +832,7 @@ func watchForTermination(ctx context.Context, cmd *exec.Cmd, pipes ...io.Closer)
 			pid = cmd.Process.Pid
 		}
 
-		logrus.Infof("[applyinator] apply was cancelled, terminating the process tree of pid %d", pid)
+		logrus.Infof("[applyinator] apply was canceled, terminating the process tree of pid %d", pid)
 		if err := terminateProcessTree(cmd); err != nil {
 			logrus.Warnf("[applyinator] error terminating the process tree of pid %d: %v", pid, err)
 		}

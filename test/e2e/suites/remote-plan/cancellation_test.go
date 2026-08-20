@@ -60,7 +60,7 @@ var _ = Describe("Remote Plan - Cancellation", Label(framework.ShortTestLabel), 
 			framework.E2ENamespace, framework.PlanSecretName,
 			k8splan.PlanCanceledAnnotation, "true")).To(Succeed())
 
-		By("Waiting for plan-state to become cancelled")
+		By("Waiting for plan-state to become canceled")
 		// Cancel is prompt: the in-flight instruction's context is canceled rather than being
 		// allowed to finish, so this must not take anything like the instruction's own cap.
 		framework.WaitForSecretFieldCondition(ctx, cl,
@@ -69,10 +69,10 @@ var _ = Describe("Remote Plan - Cancellation", Label(framework.ShortTestLabel), 
 			func(val []byte) bool { return planapi.PlanState(val) == planapi.PlanStateCancelled },
 			framework.WaitTimeout, 2*time.Second)
 
-		By("Verifying the instruction after the cancelled one never runs")
+		By("Verifying the instruction after the canceled one never runs")
 		Consistently(func() bool { return nodeFileExists(ctx, podName, cancelRunningStepTwo) },
 			20*time.Second, 4*time.Second).Should(BeFalse(),
-			"a cancelled plan must start nothing further")
+			"a canceled plan must start nothing further")
 
 		By("Verifying plan-progress reports partial execution rather than a suspension")
 		progress := framework.GetPlanProgress(ctx, cl,
@@ -109,7 +109,7 @@ var _ = Describe("Remote Plan - Cancellation", Label(framework.ShortTestLabel), 
 			map[string][]byte{planapi.PlanStateKey: []byte(planapi.PlanStatePending)},
 			map[string]string{k8splan.PlanCanceledAnnotation: "true"})).To(Succeed())
 
-		By("Waiting for plan-state to become cancelled")
+		By("Waiting for plan-state to become canceled")
 		framework.WaitForSecretFieldCondition(ctx, cl,
 			framework.E2ENamespace, framework.PlanSecretName,
 			planapi.PlanStateKey,
@@ -139,13 +139,13 @@ var _ = Describe("Remote Plan - Cancellation", Label(framework.ShortTestLabel), 
 			framework.E2ENamespace, framework.PlanSecretName)).To(BeEmpty())
 	})
 
-	It("should stay monitoring-only after cancel annotation is removed from a cancelled plan", func() {
+	It("should stay monitoring-only after cancel annotation is removed from a canceled plan", func() {
 		ctx := context.Background()
 		podName := framework.KubectlGetPodName(ctx, kubeconfigPath,
 			framework.E2ENamespace, framework.AgentLabel)
-		const cancelReport = `{"checksum":"cancelled-report","completedInstructions":1,"totalInstructions":2}`
+		const cancelReport = `{"checksum":"canceled-report","completedInstructions":1,"totalInstructions":2}`
 
-		By("Creating a cancelled terminal plan with periodic instructions")
+		By("Creating a canceled terminal plan with periodic instructions")
 		plan := framework.NewPlan().
 			WithPeriodicInstruction("should-not-run-after-cancel", "/bin/sh",
 				[]string{"-c", "touch " + cancelTerminalRan}, 5).
@@ -171,13 +171,13 @@ var _ = Describe("Remote Plan - Cancellation", Label(framework.ShortTestLabel), 
 		By("Verifying no plan instructions run after cancellation is reported")
 		Consistently(func() bool { return nodeFileExists(ctx, podName, cancelTerminalRan) },
 			20*time.Second, 4*time.Second).Should(BeFalse(),
-			"clearing the cancel annotation must not re-enable execution on a terminal cancelled plan")
+			"clearing the cancel annotation must not re-enable execution on a terminal canceled plan")
 
 		By("Verifying the cancellation report and checksum remain untouched")
 		progress := framework.GetPlanProgress(ctx, cl,
 			framework.E2ENamespace, framework.PlanSecretName)
 		Expect(progress).NotTo(BeNil())
-		Expect(progress["checksum"]).To(Equal("cancelled-report"))
+		Expect(progress["checksum"]).To(Equal("canceled-report"))
 		Expect(progress["completedInstructions"]).To(BeEquivalentTo(1))
 		Expect(progress["totalInstructions"]).To(BeEquivalentTo(2))
 		Expect(progress).NotTo(HaveKey("paused"))
@@ -237,7 +237,7 @@ var _ = Describe("Remote Plan - Cancellation", Label(framework.ShortTestLabel), 
 			framework.E2ENamespace, framework.PlanSecretName,
 			k8splan.PlanCanceledAnnotation, "true")).To(Succeed())
 
-		By("Waiting for plan-state to become cancelled")
+		By("Waiting for plan-state to become canceled")
 		framework.WaitForSecretFieldCondition(ctx, cl,
 			framework.E2ENamespace, framework.PlanSecretName,
 			planapi.PlanStateKey,
@@ -261,6 +261,6 @@ var _ = Describe("Remote Plan - Cancellation", Label(framework.ShortTestLabel), 
 		By("Verifying the child stays dead")
 		Consistently(func() int { return nodeFileLineCount(ctx, podName, cancelTreeChildLog) },
 			20*time.Second, 4*time.Second).Should(Equal(lastCount),
-			"the file grew again, so a descendant of the cancelled instruction is still alive")
+			"the file grew again, so a descendant of the canceled instruction is still alive")
 	})
 })

@@ -357,7 +357,7 @@ func (w *watcher) recordInterruptAfterApply(sc corecontrollers.SecretController,
 		// plan-state is owned by the orchestrator, and cancellation is terminal, so re-recording a cancel
 		// would permanently overwrite a plan that may already have genuinely converged. This case can
 		// occur when cancellation arrives during periodic instructions on a succeeded plan; without the
-		// guard, the in-flight path would record plan-state: cancelled even though the same cancellation
+		// guard, the in-flight path would record plan-state: canceled even though the same cancellation
 		// detected at reconcile entry would produce no write.
 		//
 		// This guard applies only to cancellation. A pause must still be recorded for a terminal plan,
