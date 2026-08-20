@@ -231,10 +231,10 @@ func handleInterrupt(interrupt applyinator.Interruption, currentPlanState planap
 // Paused is false and ResumeState is empty because there is nothing to resume.
 func handleCancellation(currentPlanState planapi.PlanState, data map[string][]byte, checksum string, totalOneTimeInstructions int) map[string][]byte {
 	if currentPlanState.IsTerminal() {
-		// This also implements cancel's write-once guard, which keys off plan-state rather than
-		// the checkpoint: PlanStateCancelled is terminal, so an already-recorded cancellation
-		// lands here and rewrites nothing. Cancel keys off plan-state — unlike pause, which keys
-		// off the checkpoint — because it writes no resumable checkpoint to key off.
+		// This also enforces cancellation's write-once rule. The guard is based on plan state rather than
+		// the checkpoint: PlanStateCanceled is terminal, so an already-recorded cancellation produces no
+		// further writes. Cancellation uses plan state because it does not create a resumable checkpoint,
+		// unlike pause, which can use the checkpoint to determine whether the suspension was already recorded.
 		logrus.Debugf("[k8splan] plan-state is %q (terminal); not recording the cancellation", currentPlanState)
 		return map[string][]byte{}
 	}
@@ -253,6 +253,7 @@ func handleCancellation(currentPlanState planapi.PlanState, data map[string][]by
 	logrus.Infof("[k8splan] %s is set; recording plan-state %q after %d of %d one-time instructions",
 		PlanCanceledAnnotation, planapi.PlanStateCancelled, completed, totalOneTimeInstructions)
 	return updates
+
 }
 
 // handlePause records a suspension by preserving a non-terminal plan state and the checkpoint from

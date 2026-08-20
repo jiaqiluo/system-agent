@@ -220,11 +220,11 @@ func suppressionMatrix() []suppressionRow {
 			// A cancel report carries Paused: false, so it is NOT an already-recorded suspension:
 			// the pause is recorded on top of it, keeping the report's Completed.
 			name:           "canceled with a cancel report: a report is not a suspension",
-			planState:      planapi.PlanStateCancelled,
+			planState:      planapi.PlanStateCanceled,
 			checkpoint:     &planProgress{Completed: 2, Total: 3},
 			wantUpdates:    1,
 			wantState:      PlanStatePaused,
-			wantCheckpoint: &planProgress{Completed: 2, Total: 3, ResumeState: planapi.PlanStateCancelled, Paused: true},
+			wantCheckpoint: &planProgress{Completed: 2, Total: 3, ResumeState: planapi.PlanStateCanceled, Paused: true},
 		},
 		{
 			// Cancel's write-once guard, which keys off the terminal plan-state rather than off

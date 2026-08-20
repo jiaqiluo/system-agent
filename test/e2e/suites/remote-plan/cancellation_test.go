@@ -66,7 +66,7 @@ var _ = Describe("Remote Plan - Cancellation", Label(framework.ShortTestLabel), 
 		framework.WaitForSecretFieldCondition(ctx, cl,
 			framework.E2ENamespace, framework.PlanSecretName,
 			planapi.PlanStateKey,
-			func(val []byte) bool { return planapi.PlanState(val) == planapi.PlanStateCancelled },
+			func(val []byte) bool { return planapi.PlanState(val) == planapi.PlanStateCanceled },
 			framework.WaitTimeout, 2*time.Second)
 
 		By("Verifying the instruction after the canceled one never runs")
@@ -113,7 +113,7 @@ var _ = Describe("Remote Plan - Cancellation", Label(framework.ShortTestLabel), 
 		framework.WaitForSecretFieldCondition(ctx, cl,
 			framework.E2ENamespace, framework.PlanSecretName,
 			planapi.PlanStateKey,
-			func(val []byte) bool { return planapi.PlanState(val) == planapi.PlanStateCancelled },
+			func(val []byte) bool { return planapi.PlanState(val) == planapi.PlanStateCanceled },
 			framework.WaitTimeout, 2*time.Second)
 
 		By("Verifying the plan's only instruction never runs, across a full re-enqueue cycle")
@@ -154,7 +154,7 @@ var _ = Describe("Remote Plan - Cancellation", Label(framework.ShortTestLabel), 
 		Expect(framework.CreatePlanSecretWithAnnotations(ctx, cl,
 			framework.E2ENamespace, framework.PlanSecretName, plan,
 			map[string][]byte{
-				planapi.PlanStateKey:       []byte(planapi.PlanStateCancelled),
+				planapi.PlanStateKey:       []byte(planapi.PlanStateCanceled),
 				k8splan.PlanProgressKey:    []byte(cancelReport),
 				k8splan.AppliedChecksumKey: []byte(""),
 				k8splan.ProbeStatusesKey:   []byte("{}"),
@@ -241,7 +241,7 @@ var _ = Describe("Remote Plan - Cancellation", Label(framework.ShortTestLabel), 
 		framework.WaitForSecretFieldCondition(ctx, cl,
 			framework.E2ENamespace, framework.PlanSecretName,
 			planapi.PlanStateKey,
-			func(val []byte) bool { return planapi.PlanState(val) == planapi.PlanStateCancelled },
+			func(val []byte) bool { return planapi.PlanState(val) == planapi.PlanStateCanceled },
 			framework.WaitTimeout, 2*time.Second)
 
 		By("Waiting for the child to stop writing")

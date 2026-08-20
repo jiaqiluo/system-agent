@@ -268,9 +268,9 @@ func TestResolveResume(t *testing.T) {
 		},
 		{
 			name:           "canceled is terminal and its report is never resumed from",
-			state:          planapi.PlanStateCancelled,
+			state:          planapi.PlanStateCanceled,
 			progress:       &planProgress{Checksum: progressChecksum, Completed: 2, Total: 5},
-			wantState:      planapi.PlanStateCancelled,
+			wantState:      planapi.PlanStateCanceled,
 			wantResumeFrom: 0,
 		},
 	}

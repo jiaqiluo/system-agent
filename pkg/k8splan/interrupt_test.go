@@ -257,14 +257,14 @@ func TestHandleInterrupt(t *testing.T) {
 		{
 			name:      "cancelling a pending plan records the cancellation",
 			interrupt: applyinator.InterruptionCanceled, currentPlanState: planapi.PlanStatePending, total: 4,
-			wantPlanState: planapi.PlanStateCancelled,
+			wantPlanState: planapi.PlanStateCanceled,
 			wantProgress:  planProgress{Checksum: progressChecksum, Completed: 0, Total: 4},
 			wantInMessage: "recording plan-state", wantLevel: decisionInfo,
 		},
 		{
 			name:      "cancelling an in-progress plan records the cancellation",
 			interrupt: applyinator.InterruptionCanceled, currentPlanState: planapi.PlanStateInProgress, total: 4,
-			wantPlanState: planapi.PlanStateCancelled,
+			wantPlanState: planapi.PlanStateCanceled,
 			wantProgress:  planProgress{Checksum: progressChecksum, Completed: 0, Total: 4},
 		},
 		{
@@ -273,7 +273,7 @@ func TestHandleInterrupt(t *testing.T) {
 			data: progressData(planProgress{
 				Checksum: progressChecksum, Completed: 3, Total: 4, ResumeState: planapi.PlanStateInProgress, Paused: true,
 			}),
-			wantPlanState: planapi.PlanStateCancelled,
+			wantPlanState: planapi.PlanStateCanceled,
 			wantProgress:  planProgress{Checksum: progressChecksum, Completed: 3, Total: 4, ResumeState: "", Paused: false},
 			// A cancellation that landed between instructions is the one outcome an operator has
 			// to act on, so it must reach a default-level journalctl.
@@ -287,7 +287,7 @@ func TestHandleInterrupt(t *testing.T) {
 		},
 		{
 			name:      "cancelling an already canceled plan writes nothing: the write-once rule",
-			interrupt: applyinator.InterruptionCanceled, currentPlanState: planapi.PlanStateCancelled, total: 4,
+			interrupt: applyinator.InterruptionCanceled, currentPlanState: planapi.PlanStateCanceled, total: 4,
 			data:          progressData(planProgress{Checksum: progressChecksum, Completed: 3, Total: 4}),
 			wantEmpty:     true,
 			wantInMessage: "not recording the cancellation", wantLevel: decisionDebug,
@@ -793,17 +793,17 @@ func TestWriteInterruptOutcomeSkipsTheUpdate(t *testing.T) {
 			// plan's outcome onto it would attribute an interrupt to the wrong plan.
 			name:       "a different plan on the server abandons the write",
 			serverPlan: otherPlanBytes,
-			updates:    map[string][]byte{planapi.PlanStateKey: []byte(planapi.PlanStateCancelled)},
+			updates:    map[string][]byte{planapi.PlanStateKey: []byte(planapi.PlanStateCanceled)},
 		},
 		{
 			name:       "no plan key on the server abandons the write",
 			serverPlan: nil,
-			updates:    map[string][]byte{planapi.PlanStateKey: []byte(planapi.PlanStateCancelled)},
+			updates:    map[string][]byte{planapi.PlanStateKey: []byte(planapi.PlanStateCanceled)},
 		},
 		{
 			name:       "an unparsable plan on the server abandons the write",
 			serverPlan: []byte("not valid json"),
-			updates:    map[string][]byte{planapi.PlanStateKey: []byte(planapi.PlanStateCancelled)},
+			updates:    map[string][]byte{planapi.PlanStateKey: []byte(planapi.PlanStateCanceled)},
 		},
 		{
 			name:       "updates that change nothing skip the update",
@@ -875,7 +875,7 @@ func TestWriteInterruptOutcomeReturnsErrorsRatherThanExiting(t *testing.T) {
 			}
 
 			w := newTestWatcher(t, true, "")
-			if _, err := w.writeInterruptOutcome(sc, checksum, map[string][]byte{planapi.PlanStateKey: []byte(planapi.PlanStateCancelled)}); err == nil {
+			if _, err := w.writeInterruptOutcome(sc, checksum, map[string][]byte{planapi.PlanStateKey: []byte(planapi.PlanStateCanceled)}); err == nil {
 				t.Fatal("expected the error to be returned to the caller, got nil")
 			}
 		})
@@ -899,7 +899,7 @@ func TestWriteInterruptOutcomeRecordsResourceVersionAndUID(t *testing.T) {
 	})
 
 	w := newTestWatcher(t, true, "")
-	if _, err := w.writeInterruptOutcome(sc, checksum, map[string][]byte{planapi.PlanStateKey: []byte(planapi.PlanStateCancelled)}); err != nil {
+	if _, err := w.writeInterruptOutcome(sc, checksum, map[string][]byte{planapi.PlanStateKey: []byte(planapi.PlanStateCanceled)}); err != nil {
 		t.Fatalf("writeInterruptOutcome returned error: %v", err)
 	}
 	if w.lastAppliedResourceVersion != "44" {
@@ -926,7 +926,7 @@ func TestWriteInterruptOutcomeDoesNotMutateTheFetchedSecret(t *testing.T) {
 	sc.EXPECT().Update(gomock.Any()).DoAndReturn(func(s *corev1.Secret) (*corev1.Secret, error) { return s, nil })
 
 	w := newTestWatcher(t, true, "")
-	if _, err := w.writeInterruptOutcome(sc, checksum, map[string][]byte{planapi.PlanStateKey: []byte(planapi.PlanStateCancelled)}); err != nil {
+	if _, err := w.writeInterruptOutcome(sc, checksum, map[string][]byte{planapi.PlanStateKey: []byte(planapi.PlanStateCanceled)}); err != nil {
 		t.Fatalf("writeInterruptOutcome returned error: %v", err)
 	}
 	if got := planapi.PlanState(fetched.Data[planapi.PlanStateKey]); got != planapi.PlanStateInProgress {

@@ -8,7 +8,7 @@ those transitions in `pkg/k8splan/reconcile.go`. Two lifecycle controls are stil
 node side:
 
 - **Cancellation** — an operator needs to abort a Day 2 operation that is hanging, was triggered by
-  accident, or has left the cluster in a partial state. `PlanStateCancelled` exists in the API but
+  accident, or has left the cluster in a partial state. `PlanStateCanceled` exists in the API but
   nothing ever writes it.
 - **Pause** — an operator needs to hold execution at an instruction boundary (maintenance window,
   incident) and later resume from where it stopped rather than re-running the whole plan.
@@ -69,7 +69,7 @@ survives a crash intact: an interrupted *execution* still re-runs from the begin
 New constants in `pkg/k8splan/watcher.go`:
 
 ```go
-// TODO: upstream these into github.com/rancher/rancher/pkg/plan alongside PlanStateCancelled,
+// TODO: upstream these into github.com/rancher/rancher/pkg/plan alongside PlanStateCanceled,
 // then drop the local definitions and bump the dependency.
 
 // PlanCanceledAnnotation, set to "true" on the plan Secret, requests that the agent abort the plan.
@@ -88,7 +88,7 @@ PlanProgressKey = "plan-progress"
 PlanStatePaused planapi.PlanState = "paused"
 ```
 
-The `plan.cattle.io/` prefix is intentional and matches the doc comment on `PlanStateCancelled` in
+The `plan.cattle.io/` prefix is intentional and matches the doc comment on `PlanStateCanceled` in
 upstream `state.go`, even though the annotations already in use by the planner
 (`PlanLastUpdatedAnnotation`, `PlanProbesPassedAnnotation`) carry the `rke.cattle.io/` prefix. The
 upstream form of these four constants is spelled out in "Proposed changes in rancher/rancher" §1;
@@ -452,7 +452,7 @@ comparison yields `InSync = false`. **Writing `paused` is safe against today's s
 Three consequences follow, and they are properties of the *existing* server rather than of this
 change:
 
-1. **`canceled` is in the same default branch.** `PlanStateCancelled` is declared in
+1. **`canceled` is in the same default branch.** `PlanStateCanceled` is declared in
    `pkg/plan/state.go:38` and has no `case` anywhere in the planner — it is a dead constant today.
    A canceled plan is therefore also evaluated by checksum and also reports `InSync = false`.
 2. **The planner will not fight a pause.** `UpdatePlan` — the only writer of `plan-state: pending`
@@ -827,7 +827,7 @@ mechanism for noticing an unpause; at `probePeriod` (5s default) it would churn 
 every node for the whole duration of a pause to no purpose.
 
 `plan_decision.go`: **no changes.** The original design added a `Halt` flag on `planStateResult` for
-`PlanStateCancelled` and a defensive `PlanStatePaused` case. Neither is needed once interrupts
+`PlanStateCanceled` and a defensive `PlanStatePaused` case. Neither is needed once interrupts
 preserve observation: `canceled` falls through the existing terminal default branch to
 `NeedsApplied: false`, and `paused` is resolved to its `ResumeState` before the function is
 reached.
@@ -885,7 +885,7 @@ value reach the node in the first place. Line references are against `73d6cd578`
 
 ### 1. Upstream the wire constants — `pkg/plan/state.go`
 
-Add alongside `PlanStateCancelled`, then bump the dependency in system-agent and delete the local
+Add alongside `PlanStateCanceled`, then bump the dependency in system-agent and delete the local
 copies:
 
 ```go
@@ -913,7 +913,7 @@ PlanProgressKey = "plan-progress"
 ```go
 case planapi.PlanStatePaused:
     result.InSync = false // suspended by an operator, not converged
-case planapi.PlanStateCancelled:
+case planapi.PlanStateCanceled:
     result.InSync = false
 ```
 
@@ -930,8 +930,8 @@ applied"` — which is indistinguishable from a slow node. Add ahead of the `InS
 ```go
 case entry.Plan.PlanState == planapi.PlanStatePaused:
     return PausedPlanStatusMessage    // "plan execution paused by operator"
-case entry.Plan.PlanState == planapi.PlanStateCancelled:
-    return CancelledPlanStatusMessage // "plan execution canceled by operator"
+case entry.Plan.PlanState == planapi.PlanStateCanceled:
+    return CanceledPlanStatusMessage // "plan execution canceled by operator"
 ```
 
 This is the highest-value item in the list and the cheapest. `Message` in `pkg/plan/store.go`
@@ -955,7 +955,7 @@ the annotation is what re-arms the node:
 
 ```go
 v, ok := entry.Metadata.Annotations[planapi.PlanCanceledAnnotation]
-if entry.Plan.PlanState == planapi.PlanStateCancelled && (!ok || v == "false") {
+if entry.Plan.PlanState == planapi.PlanStateCanceled && (!ok || v == "false") {
     // operator cleared the cancellation; re-drive the existing plan
 }
 ```

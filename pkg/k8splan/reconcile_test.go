@@ -1013,7 +1013,7 @@ func TestReconcileSecretInterruptAtEntrySuppressesTheApply(t *testing.T) {
 			name:       "cancel on in-progress records a terminal cancellation and a report, not a suspension",
 			annotation: PlanCanceledAnnotation,
 			planState:  planapi.PlanStateInProgress,
-			wantState:  planapi.PlanStateCancelled,
+			wantState:  planapi.PlanStateCanceled,
 			wantPaused: false,
 		},
 		{
@@ -1513,9 +1513,9 @@ func TestReconcileSecretCancelDuringApplyIsNotRecordedAsAFailure(t *testing.T) {
 		t.Fatalf("reconcileSecret returned error: %v", err)
 	}
 
-	if planapi.PlanState(result.Data[planapi.PlanStateKey]) != planapi.PlanStateCancelled {
+	if planapi.PlanState(result.Data[planapi.PlanStateKey]) != planapi.PlanStateCanceled {
 		t.Errorf("expected plan-state %q, got %q; a cancel-induced kill must not be reported as a plan failure",
-			planapi.PlanStateCancelled, result.Data[planapi.PlanStateKey])
+			planapi.PlanStateCanceled, result.Data[planapi.PlanStateKey])
 	}
 	if len(result.Data[FailedChecksumKey]) != 0 || len(result.Data[FailureCountKey]) != 0 || len(result.Data[FailedOutputKey]) != 0 {
 		t.Errorf("expected the failure bookkeeping to be untouched, got failed-checksum %q, failure-count %q, failed-output of %d bytes",
@@ -1535,7 +1535,7 @@ func TestReconcileSecretCancelDuringApplyIsNotRecordedAsAFailure(t *testing.T) {
 	}
 }
 
-func TestReconcileSecretCancelledTerminalPlanMonitorsOnly(t *testing.T) {
+func TestReconcileSecretCanceledTerminalPlanMonitorsOnly(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("requires a POSIX shell")
 	}
@@ -1552,7 +1552,7 @@ func TestReconcileSecretCancelledTerminalPlanMonitorsOnly(t *testing.T) {
 
 	cancelReport := marshalPlanProgress(planProgress{Checksum: checksum, Completed: 1, Total: 2})
 	secret := newInterruptTestSecret(planBytes, nil, map[string][]byte{
-		planapi.PlanStateKey: []byte(planapi.PlanStateCancelled),
+		planapi.PlanStateKey: []byte(planapi.PlanStateCanceled),
 		AppliedChecksumKey:   []byte(""),
 		PlanProgressKey:      cancelReport,
 		ProbeStatusesKey:     []byte("{}"),
@@ -1567,8 +1567,8 @@ func TestReconcileSecretCancelledTerminalPlanMonitorsOnly(t *testing.T) {
 	}
 
 	assertPathAbsent(t, periodicSentinel, "a canceled terminal plan should be monitored only")
-	if got := planapi.PlanState(result.Data[planapi.PlanStateKey]); got != planapi.PlanStateCancelled {
-		t.Errorf("expected plan-state to remain %q, got %q", planapi.PlanStateCancelled, got)
+	if got := planapi.PlanState(result.Data[planapi.PlanStateKey]); got != planapi.PlanStateCanceled {
+		t.Errorf("expected plan-state to remain %q, got %q", planapi.PlanStateCanceled, got)
 	}
 	if got := string(result.Data[AppliedChecksumKey]); got != "" {
 		t.Errorf("expected applied-checksum to remain empty for a canceled plan, got %q", got)
