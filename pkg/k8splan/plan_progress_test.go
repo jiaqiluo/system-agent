@@ -15,7 +15,7 @@ const (
 )
 
 // progressData renders p into the Secret data map shape parsePlanProgress and resolveResume read.
-func progressData(p planProgress) map[string][]byte {
+func progressData(p PlanProgress) map[string][]byte {
 	return map[string][]byte{PlanProgressKey: marshalPlanProgress(p)}
 }
 
@@ -28,11 +28,11 @@ func TestPlanProgressRoundTrip(t *testing.T) {
 
 	tests := []struct {
 		name string
-		p    planProgress
+		p    PlanProgress
 	}{
 		{
 			name: "every field set",
-			p: planProgress{
+			p: PlanProgress{
 				Checksum:    progressChecksum,
 				Completed:   2,
 				Total:       5,
@@ -42,7 +42,7 @@ func TestPlanProgressRoundTrip(t *testing.T) {
 		},
 		{
 			name: "only the required fields set",
-			p: planProgress{
+			p: PlanProgress{
 				Checksum:  progressChecksum,
 				Completed: 0,
 				Total:     3,
@@ -64,12 +64,12 @@ func TestPlanProgressRoundTrip(t *testing.T) {
 func TestParsePlanProgress(t *testing.T) {
 	t.Parallel()
 
-	stored := planProgress{Checksum: progressChecksum, Completed: 2, Total: 5, ResumeState: planapi.PlanStateInProgress, Paused: true}
+	stored := PlanProgress{Checksum: progressChecksum, Completed: 2, Total: 5, ResumeState: planapi.PlanStateInProgress, Paused: true}
 
 	tests := []struct {
 		name string
 		data map[string][]byte
-		want planProgress
+		want PlanProgress
 	}{
 		{
 			name: "checksum matches: returned verbatim",
@@ -78,28 +78,28 @@ func TestParsePlanProgress(t *testing.T) {
 		},
 		{
 			name: "checksum belongs to a different plan: zero value",
-			data: progressData(planProgress{Checksum: otherChecksum, Completed: 5, Total: 9, Paused: true}),
-			want: planProgress{},
+			data: progressData(PlanProgress{Checksum: otherChecksum, Completed: 5, Total: 9, Paused: true}),
+			want: PlanProgress{},
 		},
 		{
 			name: "key absent: zero value",
 			data: map[string][]byte{AppliedChecksumKey: []byte(progressChecksum)},
-			want: planProgress{},
+			want: PlanProgress{},
 		},
 		{
 			name: "key present but empty (a cleared checkpoint): zero value",
 			data: map[string][]byte{PlanProgressKey: {}},
-			want: planProgress{},
+			want: PlanProgress{},
 		},
 		{
 			name: "malformed JSON: zero value, no panic",
 			data: map[string][]byte{PlanProgressKey: []byte("{not json")},
-			want: planProgress{},
+			want: PlanProgress{},
 		},
 		{
 			name: "well-formed JSON of the wrong shape: zero value, no panic",
 			data: map[string][]byte{PlanProgressKey: []byte(`["a","b"]`)},
-			want: planProgress{},
+			want: PlanProgress{},
 		},
 	}
 
@@ -122,15 +122,16 @@ func TestParsePlanProgress(t *testing.T) {
 func TestMarshalPlanProgressPinsJSONTagNames(t *testing.T) {
 	t.Parallel()
 
-	raw := string(marshalPlanProgress(planProgress{
-		Checksum:    progressChecksum,
-		Completed:   2,
-		Total:       5,
-		ResumeState: planapi.PlanStateInProgress,
-		Paused:      true,
+	raw := string(marshalPlanProgress(PlanProgress{
+		Checksum:              progressChecksum,
+		Completed:             2,
+		Total:                 5,
+		ResumeState:           planapi.PlanStateInProgress,
+		Paused:                true,
+		TerminationIncomplete: true,
 	}))
 
-	want := `{"checksum":"checksum-a","completedInstructions":2,"totalInstructions":5,"resumeState":"in-progress","paused":true}`
+	want := `{"checksum":"checksum-a","completedInstructions":2,"totalInstructions":5,"resumeState":"in-progress","paused":true,"terminationIncomplete":true}`
 	if raw != want {
 		t.Errorf("marshalled checkpoint = %s, want %s", raw, want)
 	}
@@ -141,9 +142,9 @@ func TestMarshalPlanProgressPinsJSONTagNames(t *testing.T) {
 func TestMarshalPlanProgressOmitsEmptyOptionalFields(t *testing.T) {
 	t.Parallel()
 
-	raw := string(marshalPlanProgress(planProgress{Checksum: progressChecksum, Completed: 1, Total: 4}))
+	raw := string(marshalPlanProgress(PlanProgress{Checksum: progressChecksum, Completed: 1, Total: 4}))
 
-	for _, unwanted := range []string{`"resumeState"`, `"paused"`} {
+	for _, unwanted := range []string{`"resumeState"`, `"paused"`, `"terminationIncomplete"`} {
 		if strings.Contains(raw, unwanted) {
 			t.Errorf("expected marshalled checkpoint to omit %s, got %s", unwanted, raw)
 		}
@@ -163,14 +164,14 @@ func TestResolveResume(t *testing.T) {
 		name  string
 		state planapi.PlanState
 		// progress is the checkpoint on the wire; nil means PlanProgressKey is absent.
-		progress       *planProgress
+		progress       *PlanProgress
 		wantState      planapi.PlanState
 		wantResumeFrom int
 	}{
 		{
 			name:           "checksum flow never has a checkpoint to resolve",
 			state:          "",
-			progress:       &planProgress{Checksum: progressChecksum, Completed: 4, Total: 6, Paused: true},
+			progress:       &PlanProgress{Checksum: progressChecksum, Completed: 4, Total: 6, Paused: true},
 			wantState:      "",
 			wantResumeFrom: 0,
 		},
@@ -189,14 +190,14 @@ func TestResolveResume(t *testing.T) {
 		{
 			name:           "in-progress with a cancel report is not a suspension",
 			state:          planapi.PlanStateInProgress,
-			progress:       &planProgress{Checksum: progressChecksum, Completed: 2, Total: 5},
+			progress:       &PlanProgress{Checksum: progressChecksum, Completed: 2, Total: 5},
 			wantState:      planapi.PlanStateInProgress,
 			wantResumeFrom: 0,
 		},
 		{
 			name:           "a live checkpoint resumes even when an external write moved plan-state out from under it",
 			state:          planapi.PlanStateInProgress,
-			progress:       &planProgress{Checksum: progressChecksum, Completed: 2, Total: 5, ResumeState: planapi.PlanStateInProgress, Paused: true},
+			progress:       &PlanProgress{Checksum: progressChecksum, Completed: 2, Total: 5, ResumeState: planapi.PlanStateInProgress, Paused: true},
 			wantState:      planapi.PlanStateInProgress,
 			wantResumeFrom: 2,
 		},
@@ -209,14 +210,14 @@ func TestResolveResume(t *testing.T) {
 		{
 			name:           "paused with an unsuspended checkpoint: Paused is the sole gate on Completed",
 			state:          PlanStatePaused,
-			progress:       &planProgress{Checksum: progressChecksum, Completed: 2, Total: 5},
+			progress:       &PlanProgress{Checksum: progressChecksum, Completed: 2, Total: 5},
 			wantState:      planapi.PlanStateInProgress,
 			wantResumeFrom: 0,
 		},
 		{
 			name:           "the ordinary unpause resumes at the checkpoint",
 			state:          PlanStatePaused,
-			progress:       &planProgress{Checksum: progressChecksum, Completed: 2, Total: 5, ResumeState: planapi.PlanStateInProgress, Paused: true},
+			progress:       &PlanProgress{Checksum: progressChecksum, Completed: 2, Total: 5, ResumeState: planapi.PlanStateInProgress, Paused: true},
 			wantState:      planapi.PlanStateInProgress,
 			wantResumeFrom: 2,
 		},
@@ -224,21 +225,21 @@ func TestResolveResume(t *testing.T) {
 			// Defaulting here would re-execute a completed Day 2 operation in full.
 			name:           "a pause on a plan running only periodic instructions restores succeeded",
 			state:          PlanStatePaused,
-			progress:       &planProgress{Checksum: progressChecksum, Completed: 3, Total: 3, ResumeState: planapi.PlanStateSucceeded, Paused: true},
+			progress:       &PlanProgress{Checksum: progressChecksum, Completed: 3, Total: 3, ResumeState: planapi.PlanStateSucceeded, Paused: true},
 			wantState:      planapi.PlanStateSucceeded,
 			wantResumeFrom: 3,
 		},
 		{
 			name:           "an empty resume state falls back to in-progress",
 			state:          PlanStatePaused,
-			progress:       &planProgress{Checksum: progressChecksum, Completed: 1, Total: 5, Paused: true},
+			progress:       &PlanProgress{Checksum: progressChecksum, Completed: 1, Total: 5, Paused: true},
 			wantState:      planapi.PlanStateInProgress,
 			wantResumeFrom: 1,
 		},
 		{
 			name:           "a checkpoint for a different plan must not position this one",
 			state:          PlanStatePaused,
-			progress:       &planProgress{Checksum: otherChecksum, Completed: 5, Total: 8, ResumeState: planapi.PlanStateInProgress, Paused: true},
+			progress:       &PlanProgress{Checksum: otherChecksum, Completed: 5, Total: 8, ResumeState: planapi.PlanStateInProgress, Paused: true},
 			wantState:      planapi.PlanStateInProgress,
 			wantResumeFrom: 0,
 		},
@@ -249,14 +250,14 @@ func TestResolveResume(t *testing.T) {
 			// cannot write such a record; a hand-edited Secret can.
 			name:           "a hand-edited resume state of paused is ignored rather than stalling the plan forever",
 			state:          PlanStatePaused,
-			progress:       &planProgress{Checksum: progressChecksum, Completed: 2, Total: 5, ResumeState: PlanStatePaused, Paused: true},
+			progress:       &PlanProgress{Checksum: progressChecksum, Completed: 2, Total: 5, ResumeState: PlanStatePaused, Paused: true},
 			wantState:      planapi.PlanStateInProgress,
 			wantResumeFrom: 2,
 		},
 		{
 			name:           "a hand-edited resume state of paused is ignored without a suspended checkpoint too",
 			state:          PlanStatePaused,
-			progress:       &planProgress{Checksum: progressChecksum, Completed: 2, Total: 5, ResumeState: PlanStatePaused},
+			progress:       &PlanProgress{Checksum: progressChecksum, Completed: 2, Total: 5, ResumeState: PlanStatePaused},
 			wantState:      planapi.PlanStateInProgress,
 			wantResumeFrom: 0,
 		},
@@ -269,7 +270,7 @@ func TestResolveResume(t *testing.T) {
 		{
 			name:           "canceled is terminal and its report is never resumed from",
 			state:          planapi.PlanStateCanceled,
-			progress:       &planProgress{Checksum: progressChecksum, Completed: 2, Total: 5},
+			progress:       &PlanProgress{Checksum: progressChecksum, Completed: 2, Total: 5},
 			wantState:      planapi.PlanStateCanceled,
 			wantResumeFrom: 0,
 		},

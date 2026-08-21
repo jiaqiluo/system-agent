@@ -349,7 +349,7 @@ func TestUpdateSecretConflictMergeSkipsKeysAbsentFromOurCopy(t *testing.T) {
 	t.Parallel()
 
 	ourPlan, ourChecksum := marshalPlan(t, planapi.Plan{})
-	progress := marshalPlanProgress(planProgress{Checksum: ourChecksum, Completed: 1, Total: 3, Paused: true})
+	progress := marshalPlanProgress(PlanProgress{Checksum: ourChecksum, Completed: 1, Total: 3, Paused: true})
 
 	// Our in-hand copy deliberately carries neither FailedOutputKey nor SuccessCountKey.
 	ours := &corev1.Secret{
@@ -417,7 +417,7 @@ func TestUpdateSecretConflictMergeCarriesAnEmptyClear(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Namespace: testNamespace, Name: testSecret, ResourceVersion: "2"},
 		Data: map[string][]byte{
 			PlanKey:         ourPlan,
-			PlanProgressKey: marshalPlanProgress(planProgress{Checksum: ourChecksum, Completed: 1, Total: 3, Paused: true}),
+			PlanProgressKey: marshalPlanProgress(PlanProgress{Checksum: ourChecksum, Completed: 1, Total: 3, Paused: true}),
 		},
 	}
 

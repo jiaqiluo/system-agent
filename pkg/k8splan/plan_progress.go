@@ -7,11 +7,11 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-// planProgress is the resume checkpoint stored under PlanProgressKey. It is scoped only to the plan
+// PlanProgress is the resume checkpoint stored under PlanProgressKey. It is scoped only to the plan
 // checksum: a checkpoint from a previous agent lifetime is valid, while one from a different plan
 // is ignored. This allows an agent that restarts while a plan is paused to resume from where it
 // stopped instead of re-running the plan from the beginning.
-type planProgress struct {
+type PlanProgress struct {
 	Checksum    string            `json:"checksum"`
 	Completed   int               `json:"completedInstructions"`
 	Total       int               `json:"totalInstructions"`
@@ -24,36 +24,48 @@ type planProgress struct {
 	// from. The resume commit also clears Paused, preventing the checkpoint from granting another resume
 	// once the plan is no longer suspended.
 	Paused bool `json:"paused,omitempty"`
+
+	// TerminationIncomplete reports that an interrupted instruction was signaled but processes from its
+	// process tree were still running once the agent gave up on them, so the node is not necessarily
+	// quiescent. It is a report only: nothing in the agent reads it back to make a decision.
+	//
+	// Unlike Paused it is not bounded by the suspension that recorded it, because nothing the agent does
+	// afterwards makes a surviving process go away. It is preserved by every rewrite of the checkpoint and
+	// disappears only when the checkpoint itself is cleared, which happens when an apply of this plan runs
+	// to completion, or when the plan content changes and the checksum no longer matches.
+	//
+	// It can only be a lower bound; see applyinator.ApplyOutput.TerminationIncomplete.
+	TerminationIncomplete bool `json:"terminationIncomplete,omitempty"`
 }
 
 // parsePlanProgress decodes the checkpoint stored under PlanProgressKey.
 //   - key absent, malformed JSON, or a checksum that does not match the plan being reconciled:
 //     the zero value.
 //   - checksum matches: returned verbatim, whichever agent lifetime wrote it.
-func parsePlanProgress(data map[string][]byte, checksum string) planProgress {
+func parsePlanProgress(data map[string][]byte, checksum string) PlanProgress {
 	raw, ok := data[PlanProgressKey]
 	if !ok || len(raw) == 0 {
 		// An empty value represents a cleared checkpoint, not malformed data. Treat it as absent to avoid
 		// logging a spurious decode error on every reconcile. The checkpoint must be cleared by writing an
 		// empty value rather than deleting the key; see secretConflictMergeKeys.
-		return planProgress{}
+		return PlanProgress{}
 	}
-	var p planProgress
+	var p PlanProgress
 	if err := json.Unmarshal(raw, &p); err != nil {
 		// Operator-visible corruption, but not fatal: the zero value costs at worst a
 		// re-execution, which is always safe.
 		logrus.Errorf("[k8splan] error while parsing plan progress: %v", err)
-		return planProgress{}
+		return PlanProgress{}
 	}
 	if p.Checksum != checksum {
 		logrus.Debugf("[k8splan] discarding plan progress recorded for checksum %s while reconciling checksum %s", p.Checksum, checksum)
-		return planProgress{}
+		return PlanProgress{}
 	}
 	return p
 }
 
 // marshalPlanProgress encodes p for storage under PlanProgressKey.
-func marshalPlanProgress(p planProgress) []byte {
+func marshalPlanProgress(p PlanProgress) []byte {
 	raw, err := json.Marshal(p)
 	if err != nil {
 		// Unreachable: a struct of strings, ints and a bool cannot fail to marshal.

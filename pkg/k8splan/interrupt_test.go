@@ -197,14 +197,14 @@ func TestReadInterrupt(t *testing.T) {
 
 // decodeProgress decodes the checkpoint handleInterrupt wrote, so the assertions are made against
 // the struct rather than against a particular JSON encoding.
-func decodeProgress(t *testing.T, updates map[string][]byte) planProgress {
+func decodeProgress(t *testing.T, updates map[string][]byte) PlanProgress {
 	t.Helper()
 
 	raw, ok := updates[PlanProgressKey]
 	if !ok {
 		t.Fatalf("updates carry no %s key: %v", PlanProgressKey, updates)
 	}
-	var p planProgress
+	var p PlanProgress
 	if err := json.Unmarshal(raw, &p); err != nil {
 		t.Fatalf("failed to decode the %s value %q: %v", PlanProgressKey, string(raw), err)
 	}
@@ -243,7 +243,7 @@ func TestHandleInterrupt(t *testing.T) {
 		total            int
 		wantEmpty        bool
 		wantPlanState    planapi.PlanState
-		wantProgress     planProgress
+		wantProgress     PlanProgress
 		// wantInMessage is a substring at least one decision log must contain. Rows that name one
 		// are rows whose exact wording something outside this package depends on, or where the
 		// level is the whole point; "" skips the assertion.
@@ -258,23 +258,23 @@ func TestHandleInterrupt(t *testing.T) {
 			name:      "cancelling a pending plan records the cancellation",
 			interrupt: applyinator.InterruptionCanceled, currentPlanState: planapi.PlanStatePending, total: 4,
 			wantPlanState: planapi.PlanStateCanceled,
-			wantProgress:  planProgress{Checksum: progressChecksum, Completed: 0, Total: 4},
+			wantProgress:  PlanProgress{Checksum: progressChecksum, Completed: 0, Total: 4},
 			wantInMessage: "recording plan-state", wantLevel: decisionInfo,
 		},
 		{
 			name:      "cancelling an in-progress plan records the cancellation",
 			interrupt: applyinator.InterruptionCanceled, currentPlanState: planapi.PlanStateInProgress, total: 4,
 			wantPlanState: planapi.PlanStateCanceled,
-			wantProgress:  planProgress{Checksum: progressChecksum, Completed: 0, Total: 4},
+			wantProgress:  PlanProgress{Checksum: progressChecksum, Completed: 0, Total: 4},
 		},
 		{
 			name:      "cancelling reports how far the plan got, but never as a resumable suspension",
 			interrupt: applyinator.InterruptionCanceled, currentPlanState: planapi.PlanStateInProgress, total: 4,
-			data: progressData(planProgress{
+			data: progressData(PlanProgress{
 				Checksum: progressChecksum, Completed: 3, Total: 4, ResumeState: planapi.PlanStateInProgress, Paused: true,
 			}),
 			wantPlanState: planapi.PlanStateCanceled,
-			wantProgress:  planProgress{Checksum: progressChecksum, Completed: 3, Total: 4, ResumeState: "", Paused: false},
+			wantProgress:  PlanProgress{Checksum: progressChecksum, Completed: 3, Total: 4, ResumeState: "", Paused: false},
 			// A cancellation that landed between instructions is the one outcome an operator has
 			// to act on, so it must reach a default-level journalctl.
 			wantInMessage: "may be left in an inconsistent state", wantLevel: decisionWarn,
@@ -288,7 +288,7 @@ func TestHandleInterrupt(t *testing.T) {
 		{
 			name:      "cancelling an already canceled plan writes nothing: the write-once rule",
 			interrupt: applyinator.InterruptionCanceled, currentPlanState: planapi.PlanStateCanceled, total: 4,
-			data:          progressData(planProgress{Checksum: progressChecksum, Completed: 3, Total: 4}),
+			data:          progressData(PlanProgress{Checksum: progressChecksum, Completed: 3, Total: 4}),
 			wantEmpty:     true,
 			wantInMessage: "not recording the cancellation", wantLevel: decisionDebug,
 		},
@@ -296,13 +296,13 @@ func TestHandleInterrupt(t *testing.T) {
 			name:      "pausing a pending plan resumes into pending",
 			interrupt: applyinator.InterruptionPaused, currentPlanState: planapi.PlanStatePending, total: 4,
 			wantPlanState: PlanStatePaused,
-			wantProgress:  planProgress{Checksum: progressChecksum, Completed: 0, Total: 4, ResumeState: planapi.PlanStatePending, Paused: true},
+			wantProgress:  PlanProgress{Checksum: progressChecksum, Completed: 0, Total: 4, ResumeState: planapi.PlanStatePending, Paused: true},
 		},
 		{
 			name:      "pausing an in-progress plan resumes into in-progress",
 			interrupt: applyinator.InterruptionPaused, currentPlanState: planapi.PlanStateInProgress, total: 4,
 			wantPlanState: PlanStatePaused,
-			wantProgress:  planProgress{Checksum: progressChecksum, Completed: 0, Total: 4, ResumeState: planapi.PlanStateInProgress, Paused: true},
+			wantProgress:  PlanProgress{Checksum: progressChecksum, Completed: 0, Total: 4, ResumeState: planapi.PlanStateInProgress, Paused: true},
 			wantInMessage: "holding the plan at", wantLevel: decisionInfo,
 		},
 		{
@@ -311,18 +311,18 @@ func TestHandleInterrupt(t *testing.T) {
 			name:      "pausing a succeeded plan resumes into succeeded, not in-progress",
 			interrupt: applyinator.InterruptionPaused, currentPlanState: planapi.PlanStateSucceeded, total: 4,
 			wantPlanState: PlanStatePaused,
-			wantProgress:  planProgress{Checksum: progressChecksum, Completed: 0, Total: 4, ResumeState: planapi.PlanStateSucceeded, Paused: true},
+			wantProgress:  PlanProgress{Checksum: progressChecksum, Completed: 0, Total: 4, ResumeState: planapi.PlanStateSucceeded, Paused: true},
 		},
 		{
 			name:      "pausing a failed plan resumes into failed",
 			interrupt: applyinator.InterruptionPaused, currentPlanState: planapi.PlanStateFailed, total: 4,
 			wantPlanState: PlanStatePaused,
-			wantProgress:  planProgress{Checksum: progressChecksum, Completed: 0, Total: 4, ResumeState: planapi.PlanStateFailed, Paused: true},
+			wantProgress:  PlanProgress{Checksum: progressChecksum, Completed: 0, Total: 4, ResumeState: planapi.PlanStateFailed, Paused: true},
 		},
 		{
 			name:      "pausing when a suspension is already recorded writes nothing: the write-once rule",
 			interrupt: applyinator.InterruptionPaused, currentPlanState: PlanStatePaused, total: 4,
-			data:      progressData(planProgress{Checksum: progressChecksum, Completed: 2, Total: 4, ResumeState: planapi.PlanStateInProgress, Paused: true}),
+			data:      progressData(PlanProgress{Checksum: progressChecksum, Completed: 2, Total: 4, ResumeState: planapi.PlanStateInProgress, Paused: true}),
 			wantEmpty: true,
 			// This exact wording is load-bearing outside this package: it is the only positive
 			// liveness signal the e2e restart spec has that the restarted agent reconciled the
@@ -337,21 +337,40 @@ func TestHandleInterrupt(t *testing.T) {
 			name:      "pausing when plan-state is paused but no checkpoint exists records the suspension",
 			interrupt: applyinator.InterruptionPaused, currentPlanState: PlanStatePaused, total: 4,
 			wantPlanState: PlanStatePaused,
-			wantProgress:  planProgress{Checksum: progressChecksum, Completed: 0, Total: 4, ResumeState: "", Paused: true},
+			wantProgress:  PlanProgress{Checksum: progressChecksum, Completed: 0, Total: 4, ResumeState: "", Paused: true},
 		},
 		{
 			name:      "pausing preserves completed from a checksum-matching checkpoint",
 			interrupt: applyinator.InterruptionPaused, currentPlanState: planapi.PlanStateInProgress, total: 4,
-			data:          progressData(planProgress{Checksum: progressChecksum, Completed: 3, Total: 4}),
+			data:          progressData(PlanProgress{Checksum: progressChecksum, Completed: 3, Total: 4}),
 			wantPlanState: PlanStatePaused,
-			wantProgress:  planProgress{Checksum: progressChecksum, Completed: 3, Total: 4, ResumeState: planapi.PlanStateInProgress, Paused: true},
+			wantProgress:  PlanProgress{Checksum: progressChecksum, Completed: 3, Total: 4, ResumeState: planapi.PlanStateInProgress, Paused: true},
+		},
+		{
+			// Neither path can observe the node's processes: no apply is in flight at reconcile entry.
+			// Dropping the flag would silently retract a warning that is still true, so both rewrites of
+			// the checkpoint carry it forward.
+			name:      "cancelling preserves a recorded incomplete termination",
+			interrupt: applyinator.InterruptionCanceled, currentPlanState: planapi.PlanStateInProgress, total: 4,
+			data:          progressData(PlanProgress{Checksum: progressChecksum, Completed: 2, Total: 4, TerminationIncomplete: true}),
+			wantPlanState: planapi.PlanStateCanceled,
+			wantProgress:  PlanProgress{Checksum: progressChecksum, Completed: 2, Total: 4, TerminationIncomplete: true},
+		},
+		{
+			name:      "pausing preserves a recorded incomplete termination",
+			interrupt: applyinator.InterruptionPaused, currentPlanState: planapi.PlanStateInProgress, total: 4,
+			data:          progressData(PlanProgress{Checksum: progressChecksum, Completed: 2, Total: 4, TerminationIncomplete: true}),
+			wantPlanState: PlanStatePaused,
+			wantProgress: PlanProgress{
+				Checksum: progressChecksum, Completed: 2, Total: 4, ResumeState: planapi.PlanStateInProgress, Paused: true, TerminationIncomplete: true,
+			},
 		},
 		{
 			name:      "pausing ignores a checkpoint recorded for a different plan",
 			interrupt: applyinator.InterruptionPaused, currentPlanState: planapi.PlanStateInProgress, total: 4,
-			data:          progressData(planProgress{Checksum: otherChecksum, Completed: 3, Total: 9, ResumeState: planapi.PlanStateInProgress, Paused: true}),
+			data:          progressData(PlanProgress{Checksum: otherChecksum, Completed: 3, Total: 9, ResumeState: planapi.PlanStateInProgress, Paused: true}),
 			wantPlanState: PlanStatePaused,
-			wantProgress:  planProgress{Checksum: progressChecksum, Completed: 0, Total: 4, ResumeState: planapi.PlanStateInProgress, Paused: true},
+			wantProgress:  PlanProgress{Checksum: progressChecksum, Completed: 0, Total: 4, ResumeState: planapi.PlanStateInProgress, Paused: true},
 		},
 	}
 
@@ -739,7 +758,7 @@ func TestWriteInterruptOutcomeRetriesOnConflictAndPreservesTheCheckpoint(t *test
 		return s, nil
 	}).Times(2)
 
-	checkpoint := planProgress{Checksum: checksum, Completed: 3, Total: 5, ResumeState: planapi.PlanStateInProgress, Paused: true}
+	checkpoint := PlanProgress{Checksum: checksum, Completed: 3, Total: 5, ResumeState: planapi.PlanStateInProgress, Paused: true}
 	updates := map[string][]byte{
 		planapi.PlanStateKey: []byte(PlanStatePaused),
 		PlanProgressKey:      marshalPlanProgress(checkpoint),

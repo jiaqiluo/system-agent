@@ -7,6 +7,8 @@ import (
 	"os"
 	"os/exec"
 	"sync"
+	"time"
+	"unsafe"
 
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/windows"
@@ -18,6 +20,20 @@ type processJob struct {
 	// assigned records whether the child was successfully added to the job. If assignment
 	// failed, the job is empty, so killProcessTree must fall back to the direct child.
 	assigned bool
+}
+
+// jobObjectBasicAccountingInformation mirrors JOBOBJECT_BASIC_ACCOUNTING_INFORMATION.
+// golang.org/x/sys/windows exposes the information class but not the struct, and only ActiveProcesses
+// is read here; the preceding fields exist so the layout matches what the kernel writes.
+type jobObjectBasicAccountingInformation struct {
+	TotalUserTime             int64
+	TotalKernelTime           int64
+	ThisPeriodTotalUserTime   int64
+	ThisPeriodTotalKernelTime int64
+	TotalPageFaultCount       uint32
+	TotalProcesses            uint32
+	ActiveProcesses           uint32
+	TotalTerminatedProcesses  uint32
 }
 
 // processJobs holds the Job Object created for each running command, keyed by the *exec.Cmd it
@@ -126,6 +142,50 @@ func releaseProcessTree(cmd *exec.Cmd) {
 	if err := windows.CloseHandle(job.handle); err != nil {
 		logrus.Warnf("[applyinator] error closing the job object handle: %v", err)
 	}
+}
+
+// processTreeExited reports whether every process in the command's Job Object is gone, polling until
+// deadline. It is only meaningful once cmd.Wait() has reaped the direct child, which is still counted
+// as an active process until then.
+//
+// A descendant that escaped the job between cmd.Start() and assignProcessTree, the caveat documented
+// on assignProcessTree, is invisible here for the same reason it is invisible to the terminate call.
+func processTreeExited(cmd *exec.Cmd, deadline time.Time) bool {
+	job, ok := lookupProcessJob(cmd)
+	if !ok || !job.assigned {
+		// There is no job to inspect, so only the direct child was ever terminated and cmd.Wait() has
+		// already reaped it. There is nothing job-wide left to confirm.
+		return true
+	}
+
+	for {
+		active, err := activeProcessesInJob(job.handle)
+		if err != nil {
+			// Nothing can be confirmed either way. Report the tree as gone rather than raising a false
+			// alarm on every cancellation because the job cannot be queried.
+			logrus.Warnf("[applyinator] unable to query the job object for surviving processes: %v", err)
+			return true
+		}
+		if active == 0 {
+			return true
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return false
+		}
+		time.Sleep(min(remaining, processTreeExitPollInterval))
+	}
+}
+
+// activeProcessesInJob returns the number of processes still running in the job.
+func activeProcessesInJob(job windows.Handle) (uint32, error) {
+	var info jobObjectBasicAccountingInformation
+	err := windows.QueryInformationJobObject(job, windows.JobObjectBasicAccountingInformation,
+		uintptr(unsafe.Pointer(&info)), uint32(unsafe.Sizeof(info)), nil)
+	if err != nil {
+		return 0, err
+	}
+	return info.ActiveProcesses, nil
 }
 
 func lookupProcessJob(cmd *exec.Cmd) (processJob, bool) {

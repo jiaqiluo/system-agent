@@ -190,7 +190,8 @@ func TestExecuteCapturesStdoutStderrAndExitCode(t *testing.T) {
 				Args:    []string{"-c", tc.script},
 			}
 
-			stdout, stderr, exitCode, err := a.execute(context.Background(), "test", t.TempDir(), instruction, tc.combinedOutput, 1)
+			result, err := a.execute(context.Background(), "test", t.TempDir(), instruction, tc.combinedOutput, 1)
+			stdout, stderr, exitCode := result.Stdout, result.Stderr, result.ExitCode
 			if exitCode != tc.wantExitCode {
 				t.Errorf("expected exit code %d, got %d (err: %v)", tc.wantExitCode, exitCode, err)
 			}
@@ -234,12 +235,12 @@ func TestExecuteInjectsEnvironmentVariables(t *testing.T) {
 		Env:     []string{"FOO=bar"},
 	}
 
-	stdout, _, exitCode, err := a.execute(context.Background(), "test", executionDir, instruction, false, 5)
-	if err != nil || exitCode != 0 {
-		t.Fatalf("unexpected failure: exitCode=%d err=%v", exitCode, err)
+	result, err := a.execute(context.Background(), "test", executionDir, instruction, false, 5)
+	if err != nil || result.ExitCode != 0 {
+		t.Fatalf("unexpected failure: exitCode=%d err=%v", result.ExitCode, err)
 	}
 
-	got := string(stdout)
+	got := string(result.Stdout)
 	for _, want := range []string{"pwd=" + executionDir, "attempt=5", "foo=bar"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("expected output to contain %q, got %q", want, got)
@@ -261,12 +262,12 @@ func TestExecuteDefaultsToRunShInExecutionDir(t *testing.T) {
 	a := NewApplyinator(t.TempDir(), false, "", "", nil)
 	instruction := planapi.CommonInstruction{} // no Command set
 
-	stdout, _, exitCode, err := a.execute(context.Background(), "test", executionDir, instruction, false, 1)
-	if err != nil || exitCode != 0 {
-		t.Fatalf("unexpected failure: exitCode=%d err=%v", exitCode, err)
+	result, err := a.execute(context.Background(), "test", executionDir, instruction, false, 1)
+	if err != nil || result.ExitCode != 0 {
+		t.Fatalf("unexpected failure: exitCode=%d err=%v", result.ExitCode, err)
 	}
-	if !strings.Contains(string(stdout), "ran-default") {
-		t.Errorf("expected default run.sh to execute, got stdout=%q", stdout)
+	if !strings.Contains(string(result.Stdout), "ran-default") {
+		t.Errorf("expected default run.sh to execute, got stdout=%q", result.Stdout)
 	}
 }
 
@@ -913,10 +914,11 @@ func TestRunPeriodicInstructionsSkipsWhenNotDue(t *testing.T) {
 		"steady": {Name: "steady", LastSuccessfulRunTime: now.Add(-1 * time.Second).Format(time.UnixDate)},
 	})
 
-	output, succeeded, err := a.runPeriodicInstructions(context.Background(), executionDir, cp, existing, false, now, nil, nil)
+	periodic, err := a.runPeriodicInstructions(context.Background(), executionDir, cp, existing, false, now, nil, nil)
 	if err != nil {
 		t.Fatalf("runPeriodicInstructions returned error: %v", err)
 	}
+	output, succeeded := periodic.Output, periodic.Succeeded
 	if !succeeded {
 		t.Error("expected succeeded=true when nothing ran")
 	}
@@ -946,10 +948,11 @@ func TestRunPeriodicInstructionsRunsWhenDue(t *testing.T) {
 		},
 	}
 
-	output, succeeded, err := a.runPeriodicInstructions(context.Background(), executionDir, cp, nil, false, time.Now(), nil, nil)
+	periodic, err := a.runPeriodicInstructions(context.Background(), executionDir, cp, nil, false, time.Now(), nil, nil)
 	if err != nil {
 		t.Fatalf("runPeriodicInstructions returned error: %v", err)
 	}
+	output, succeeded := periodic.Output, periodic.Succeeded
 	if !succeeded {
 		t.Error("expected succeeded=true")
 	}
@@ -1063,10 +1066,11 @@ func TestRunPeriodicInstructionsRecordsFailure(t *testing.T) {
 				"flaky": {Name: "flaky", LastSuccessfulRunTime: previousSuccess},
 			})
 
-			output, succeeded, err := a.runPeriodicInstructions(context.Background(), executionDir, cp, existing, false, now, nil, nil)
+			periodic, err := a.runPeriodicInstructions(context.Background(), executionDir, cp, existing, false, now, nil, nil)
 			if err != nil {
 				t.Fatalf("runPeriodicInstructions returned error: %v", err)
 			}
+			output, succeeded := periodic.Output, periodic.Succeeded
 			if succeeded {
 				t.Error("expected succeeded=false because the instruction failed")
 			}
@@ -1656,11 +1660,12 @@ func TestRunPeriodicInstructionsStopsWhenInterrupted(t *testing.T) {
 				},
 			}
 
-			output, succeeded, err := a.runPeriodicInstructions(context.Background(), t.TempDir(), cp, nil, false, time.Now(),
+			periodic, err := a.runPeriodicInstructions(context.Background(), t.TempDir(), cp, nil, false, time.Now(),
 				newSignal(tc.cancel), newSignal(tc.pause))
 			if err != nil {
 				t.Fatalf("runPeriodicInstructions returned error: %v", err)
 			}
+			output, succeeded := periodic.Output, periodic.Succeeded
 			if !succeeded {
 				t.Error("expected succeeded=true: an interruption is not a failure, and nothing that ran failed")
 			}
@@ -1846,6 +1851,49 @@ func TestApplyCancelKillsTheInstructionsGrandchildren(t *testing.T) {
 	// The grandchild appends every 50ms, so a full second of a static file size means it is gone
 	// rather than merely descheduled.
 	assertFileStopsGrowing(t, sentinel, time.Second)
+	if output.TerminationIncomplete {
+		t.Error("expected the process tree to be confirmed gone, got TerminationIncomplete=true")
+	}
+}
+
+// TestApplyCancelKillsAGrandchildThatIgnoresSIGTERM drives the escalation path all the way through
+// Apply: the grandchild ignores the graceful signal, so only the SIGKILL that follows the grace
+// period can stop it.
+//
+// What it covers depends on the platform, so do not read a pass on Linux as proof of more than it is.
+// By the time the watchdog escalates, the direct child has already died from the SIGTERM but
+// cmd.Wait() has not reaped it, because it is blocked behind output pipes the grandchild still holds,
+// leaving a zombie group leader. On darwin getpgid reports ESRCH for that zombie, so before the group
+// id was captured at start the kill degraded into a signal aimed at the already-dead direct child and
+// this test failed with the grandchild still writing. Linux answers getpgid for a zombie, so it passed
+// there either way, and on the deployment platforms this is coverage of the escalation path rather
+// than a reproduction of a bug they had.
+func TestApplyCancelKillsAGrandchildThatIgnoresSIGTERM(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires a POSIX shell")
+	}
+	// Not parallel: withTerminationGrace writes a package-level var. Shortened so the test does not
+	// wait out the full production grace period before the kill.
+	withTerminationGrace(t, 500*time.Millisecond)
+
+	dir := t.TempDir()
+	sentinel := filepath.Join(dir, "grandchild-writes")
+	started := filepath.Join(dir, "started")
+
+	// `trap "" TERM` makes SIGTERM ignored rather than merely handled, so no amount of waiting will
+	// end this grandchild. The direct child sleeps in the foreground, as in backgroundedWriterCommand.
+	script := `sh -c 'trap "" TERM; while true; do echo x >> ` + sentinel + `; touch ` + started + `; sleep 0.05; done' & sleep 60`
+	instruction := planapi.CommonInstruction{Name: "term-ignorer", Command: "sh", Args: []string{"-c", script}}
+
+	output := cancelDuringInstruction(t, "checksum-cancel-sigterm-ignored", instruction, started)
+
+	if output.Interruption != InterruptionCanceled {
+		t.Errorf("expected %q, got %q", InterruptionCanceled, output.Interruption)
+	}
+	assertFileStopsGrowing(t, sentinel, time.Second)
+	if output.TerminationIncomplete {
+		t.Error("expected the killed process tree to be confirmed gone, got TerminationIncomplete=true")
+	}
 }
 
 // recordingCloser stands in for one of execute's stdout/stderr pipes and records whether
@@ -1882,7 +1930,7 @@ func (r *recordingCloser) state() (int, time.Time) {
 // fork/exec succeeds, well before sh has parsed the trap, so a test that canceled immediately
 // would signal a shell still running the *default* SIGTERM disposition: it would die instantly and
 // every case would silently observe the graceful path, whichever handler it asked for.
-func startWatchedCommand(t *testing.T, trapAction string) (context.CancelFunc, *recordingCloser, <-chan error, func()) {
+func startWatchedCommand(t *testing.T, trapAction string) (context.CancelFunc, *recordingCloser, <-chan error, func() bool) {
 	t.Helper()
 
 	installed := filepath.Join(t.TempDir(), "trap-installed")
@@ -1932,6 +1980,18 @@ func withTerminationGrace(t *testing.T, d time.Duration) {
 	original := instructionTerminationGrace
 	instructionTerminationGrace = d
 	t.Cleanup(func() { instructionTerminationGrace = original })
+}
+
+// withProcessTreeExitTimeout bounds the watchdog's final exit confirmation for the duration of the
+// test and restores it afterwards. Same t.Setenv tripwire, for the same reason, as
+// withTerminationGrace.
+func withProcessTreeExitTimeout(t *testing.T, d time.Duration) {
+	t.Helper()
+	t.Setenv("APPLYINATOR_EXIT_TIMEOUT_GUARD", "1")
+
+	original := processTreeExitTimeout
+	processTreeExitTimeout = d
+	t.Cleanup(func() { processTreeExitTimeout = original })
 }
 
 // TestWatchForTerminationClosesThePipesOnlyWhenItEscalates pins both halves of the watchdog's pipe

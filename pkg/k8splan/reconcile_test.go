@@ -835,7 +835,7 @@ func observeUpdateOrdering(t *testing.T, rec *interruptRecorder, applyMarker str
 		_, statErr := os.Stat(applyMarker)
 		// Decoded leniently rather than through checkpointIn: a terminal outcome write clears
 		// this key to an empty value, which is absence and not corruption.
-		var progress planProgress
+		var progress PlanProgress
 		_ = json.Unmarshal(s.Data[PlanProgressKey], &progress)
 
 		mu.Lock()
@@ -875,13 +875,13 @@ func assertResumeCommitLandedFirst(t *testing.T, observed []observedUpdate, want
 }
 
 // checkpointIn decodes the resume checkpoint out of a Secret data map.
-func checkpointIn(t *testing.T, data map[string][]byte) planProgress {
+func checkpointIn(t *testing.T, data map[string][]byte) PlanProgress {
 	t.Helper()
 	raw, ok := data[PlanProgressKey]
 	if !ok {
 		t.Fatalf("expected a %q checkpoint, got only the keys %v", PlanProgressKey, keysOf(data))
 	}
-	var p planProgress
+	var p PlanProgress
 	if err := json.Unmarshal(raw, &p); err != nil {
 		t.Fatalf("failed to decode the %q checkpoint %q: %v", PlanProgressKey, raw, err)
 	}
@@ -1359,7 +1359,7 @@ func TestReconcileSecretPauseDuringApplyIsNotRecordedAsAFailure(t *testing.T) {
 	assertProbeStatusPersisted(t, result.Data, probeHits)
 
 	got := checkpointIn(t, result.Data)
-	want := planProgress{Checksum: checksum, Completed: 1, Total: 2, ResumeState: planapi.PlanStateInProgress, Paused: true}
+	want := PlanProgress{Checksum: checksum, Completed: 1, Total: 2, ResumeState: planapi.PlanStateInProgress, Paused: true}
 	if got != want {
 		t.Errorf("expected checkpoint %+v, got %+v", want, got)
 	}
@@ -1386,7 +1386,7 @@ func TestReconcileSecretResumeCommitLandsBeforeTheApply(t *testing.T) {
 	// A plan held at instruction 0, whose annotation the operator has just removed.
 	secret := newInterruptTestSecret(planBytes, nil, map[string][]byte{
 		planapi.PlanStateKey: []byte(PlanStatePaused),
-		PlanProgressKey: marshalPlanProgress(planProgress{
+		PlanProgressKey: marshalPlanProgress(PlanProgress{
 			Checksum: checksum, Completed: 0, Total: 1, ResumeState: planapi.PlanStateInProgress, Paused: true,
 		}),
 	})
@@ -1432,7 +1432,7 @@ func TestReconcileSecretResumeCommitDoesNotBumpPlanRevision(t *testing.T) {
 		planapi.PlanStateKey:    []byte(PlanStatePaused),
 		planapi.PlanRevisionKey: []byte("7"),
 		AppliedChecksumKey:      []byte(checksum),
-		PlanProgressKey: marshalPlanProgress(planProgress{
+		PlanProgressKey: marshalPlanProgress(PlanProgress{
 			Checksum: checksum, Completed: 1, Total: 1, ResumeState: planapi.PlanStateSucceeded, Paused: true,
 		}),
 	})
@@ -1526,12 +1526,79 @@ func TestReconcileSecretCancelDuringApplyIsNotRecordedAsAFailure(t *testing.T) {
 	}
 
 	got := checkpointIn(t, result.Data)
-	want := planProgress{Checksum: checksum, Completed: 0, Total: 1}
+	want := PlanProgress{Checksum: checksum, Completed: 0, Total: 1}
 	if got != want {
 		t.Errorf("expected a cancellation report %+v (never a suspension: nothing resumes from it), got %+v", want, got)
 	}
 	if periods := rec.enqueuePeriods(); len(periods) != 1 || periods[0] != interruptedEnqueuePeriod {
 		t.Errorf("expected a single re-enqueue after %v, got %v", interruptedEnqueuePeriod, periods)
+	}
+}
+
+// TestRecordInterruptAfterApplyReportsIncompleteTermination pins the reporting half of the
+// cancellation contract. plan-state canceled says the plan is over; the checkpoint's
+// terminationIncomplete says whether the node was left quiescent. Those are separate claims, and
+// making the first one does not entitle the agent to make the second.
+//
+// Driven through recordInterruptAfterApply rather than a real apply because the interesting input is
+// an ApplyOutput the agent cannot be made to produce on demand: it requires a process that outlives
+// SIGKILL. applyinator's own tests cover where the flag comes from.
+func TestRecordInterruptAfterApplyReportsIncompleteTermination(t *testing.T) {
+	t.Parallel()
+
+	planBytes, _ := marshalPlan(t, planapi.Plan{
+		OneTimeInstructions: []planapi.OneTimeInstruction{touchInstruction("one", filepath.Join(t.TempDir(), "never-run"))},
+	})
+	cp, err := applyinator.CalculatePlan(planBytes)
+	if err != nil {
+		t.Fatalf("CalculatePlan returned error: %v", err)
+	}
+
+	testCases := []struct {
+		name string
+		// stored is a terminationIncomplete already on the Secret's checkpoint, from an earlier apply
+		// of the same plan.
+		stored bool
+		// reported is what this apply observed.
+		reported bool
+		want     bool
+	}{
+		{name: "this apply could not confirm the process tree was gone", reported: true, want: true},
+		{
+			// The flag reports a hazard on the node, and this apply cannot see processes an earlier one
+			// left behind, so a stored true has to survive. Over-reporting a hazard that has since been
+			// cleaned up is the safe direction.
+			name: "an earlier apply's report is not retracted", stored: true, want: true,
+		},
+		{name: "a confirmed termination reports nothing", want: false},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			data := map[string][]byte{planapi.PlanStateKey: []byte(planapi.PlanStateInProgress)}
+			if tc.stored {
+				data[PlanProgressKey] = marshalPlanProgress(PlanProgress{Checksum: cp.Checksum, Total: 1, TerminationIncomplete: true})
+			}
+			secret := newInterruptTestSecret(planBytes, nil, data)
+			sc := newInterruptTestController(t, newInterruptRecorder(secret))
+			w := newTestWatcher(t, true, "")
+
+			result, err := w.recordInterruptAfterApply(sc, secret.DeepCopy(), cp, planapi.PlanStateInProgress, true,
+				applyinator.ApplyOutput{Interruption: applyinator.InterruptionCanceled, TerminationIncomplete: tc.reported},
+				map[string]planapi.ProbeStatus{})
+			if err != nil {
+				t.Fatalf("recordInterruptAfterApply returned error: %v", err)
+			}
+
+			if got := planapi.PlanState(result.Data[planapi.PlanStateKey]); got != planapi.PlanStateCanceled {
+				t.Errorf("wrote plan-state %q, want %q: an unconfirmed termination does not change the plan's outcome", got, planapi.PlanStateCanceled)
+			}
+			if got := checkpointIn(t, result.Data).TerminationIncomplete; got != tc.want {
+				t.Errorf("checkpoint recorded terminationIncomplete=%v, want %v", got, tc.want)
+			}
+		})
 	}
 }
 
@@ -1550,7 +1617,7 @@ func TestReconcileSecretCanceledTerminalPlanMonitorsOnly(t *testing.T) {
 		},
 	})
 
-	cancelReport := marshalPlanProgress(planProgress{Checksum: checksum, Completed: 1, Total: 2})
+	cancelReport := marshalPlanProgress(PlanProgress{Checksum: checksum, Completed: 1, Total: 2})
 	secret := newInterruptTestSecret(planBytes, nil, map[string][]byte{
 		planapi.PlanStateKey: []byte(planapi.PlanStateCanceled),
 		AppliedChecksumKey:   []byte(""),
@@ -1599,7 +1666,7 @@ func TestReconcileSecretFailedTerminalPlanMonitorsOnly(t *testing.T) {
 		},
 	})
 
-	progressReport := marshalPlanProgress(planProgress{Checksum: checksum, Completed: 0, Total: 1})
+	progressReport := marshalPlanProgress(PlanProgress{Checksum: checksum, Completed: 0, Total: 1})
 	secret := newInterruptTestSecret(planBytes, nil, map[string][]byte{
 		planapi.PlanStateKey: []byte(planapi.PlanStateFailed),
 		PlanProgressKey:      progressReport,
@@ -1760,7 +1827,7 @@ func TestReconcileSecretInterruptDuringAPeriodicApplyOfATerminalPlan(t *testing.
 			if got := planapi.PlanState(writes[0].Data[planapi.PlanStateKey]); got != PlanStatePaused {
 				t.Errorf("wrote plan-state %q, want %q; a pause on a terminal plan must still be recorded", got, PlanStatePaused)
 			}
-			want := planProgress{Checksum: checksum, ResumeState: planapi.PlanStateSucceeded, Paused: true}
+			want := PlanProgress{Checksum: checksum, ResumeState: planapi.PlanStateSucceeded, Paused: true}
 			if got := checkpointIn(t, writes[0].Data); got != want {
 				t.Errorf("wrote checkpoint %+v, want %+v; the resume must restore succeeded rather than re-execute the plan", got, want)
 			}
@@ -1803,7 +1870,7 @@ func TestReconcileSecretResumeAbandonedWhenANewerPlanLanded(t *testing.T) {
 	// The in-hand copy: suspended on the old plan, annotation just cleared.
 	secret := newInterruptTestSecret(oldPlanBytes, nil, map[string][]byte{
 		planapi.PlanStateKey: []byte(PlanStatePaused),
-		PlanProgressKey: marshalPlanProgress(planProgress{
+		PlanProgressKey: marshalPlanProgress(PlanProgress{
 			Checksum: oldChecksum, Completed: 0, Total: 1, ResumeState: planapi.PlanStateInProgress, Paused: true,
 		}),
 	})
@@ -1868,7 +1935,7 @@ func TestReconcileSecretChecksumFlowMakesNoResumeCommit(t *testing.T) {
 
 	// No plan-state: the checksum flow. The leftover checkpoint must be inert, not a trigger.
 	secret := newInterruptTestSecret(planBytes, nil, map[string][]byte{
-		PlanProgressKey: marshalPlanProgress(planProgress{
+		PlanProgressKey: marshalPlanProgress(PlanProgress{
 			Checksum: checksum, Completed: 1, Total: 1, ResumeState: planapi.PlanStateSucceeded, Paused: true,
 		}),
 	})

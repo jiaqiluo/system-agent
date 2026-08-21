@@ -352,6 +352,14 @@ func (w *watcher) reconcileSecret(ctx context.Context, sc corecontrollers.Secret
 func (w *watcher) recordInterruptAfterApply(sc corecontrollers.SecretController, secret *corev1.Secret, cp applyinator.CalculatedPlan,
 	effectiveState planapi.PlanState, needsApplied bool, applyOutput applyinator.ApplyOutput, probeStatuses map[string]planapi.ProbeStatus,
 ) (*corev1.Secret, error) {
+	if applyOutput.TerminationIncomplete {
+		// Logged before the write-once guard below so the operator is told even when the lifecycle write is
+		// suppressed. This is the one interrupt outcome that says something about the node rather than about
+		// the plan: the plan is over, but work it started may still be running and modifying the node.
+		logrus.Warnf("[k8splan] the %s interrupt of the plan with checksum %s could not confirm that every process it terminated had exited; "+
+			"work started by this plan may still be modifying the node", applyOutput.Interruption, cp.Checksum)
+	}
+
 	if applyOutput.Interruption == applyinator.InterruptionCanceled && effectiveState.IsTerminal() {
 		// Apply the same write-once rule used by handleCancellation at reconcile entry. A terminal
 		// plan-state is owned by the orchestrator, and cancellation is terminal, so re-recording a cancel
@@ -379,7 +387,12 @@ func (w *watcher) recordInterruptAfterApply(sc corecontrollers.SecretController,
 		return secret, nil
 	}
 
-	progress := planProgress{Checksum: cp.Checksum}
+	progress := PlanProgress{Checksum: cp.Checksum}
+	// OR-ed with the stored value rather than assigned. The flag reports a hazard on the node, and this
+	// apply cannot observe processes left behind by an earlier one, so a stored true must survive. Erring
+	// towards reporting a hazard that has since been cleaned up is the safe direction; the opposite would
+	// silently retract the warning.
+	progress.TerminationIncomplete = applyOutput.TerminationIncomplete || parsePlanProgress(secret.Data, cp.Checksum).TerminationIncomplete
 	if needsApplied {
 		// The one-time set was already running, so the Secret was transitioned to in-progress before
 		// Apply started. That is the state from which the plan should resume.
@@ -432,9 +445,10 @@ func (w *watcher) recordInterruptAfterApply(sc corecontrollers.SecretController,
 // inactive, so the only remaining question is whether a suspension was recorded: plan-state is
 // paused, or the checkpoint for this plan indicates one.
 //
-// Completed and Total are preserved as a record of the plan's progress. Paused: false revokes the
-// checkpoint's ability to trigger another resume, and ResumeState is cleared because it has already
-// been consumed into effectiveState.
+// Completed, Total and TerminationIncomplete are preserved as a record of what happened to the plan;
+// only the fields that grant a resume are reset. Paused: false revokes the checkpoint's ability to
+// trigger another resume, and ResumeState is cleared because it has already been consumed into
+// effectiveState.
 func resumeCommitUpdates(currentPlanState, effectiveState planapi.PlanState, data map[string][]byte, checksum string) map[string][]byte {
 	progress := parsePlanProgress(data, checksum)
 	if currentPlanState != PlanStatePaused && !progress.Paused {

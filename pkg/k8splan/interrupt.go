@@ -239,21 +239,25 @@ func handleCancellation(currentPlanState planapi.PlanState, data map[string][]by
 		return map[string][]byte{}
 	}
 
-	completed := parsePlanProgress(data, checksum).Completed
+	existing := parsePlanProgress(data, checksum)
 	updates := map[string][]byte{
 		planapi.PlanStateKey: []byte(planapi.PlanStateCancelled),
-		PlanProgressKey: marshalPlanProgress(planProgress{
+		PlanProgressKey: marshalPlanProgress(PlanProgress{
 			Checksum:  checksum,
-			Completed: completed,
+			Completed: existing.Completed,
 			Total:     totalOneTimeInstructions,
+			// Carried over rather than recomputed: no apply is in flight on this path, so this reconcile
+			// cannot observe anything about the node's processes, and dropping the flag would silently
+			// retract a warning that is still true.
+			TerminationIncomplete: existing.TerminationIncomplete,
 			// ResumeState and Paused are deliberately left zero: a cancellation is a report, and
 			// only a suspended checkpoint ever grants a resume.
 		}),
 	}
-	logrus.Infof("[k8splan] %s is set; recording plan-state %q after %d of %d one-time instructions",
-		PlanCanceledAnnotation, planapi.PlanStateCancelled, completed, totalOneTimeInstructions)
+	logrus.Infof("[k8splan] %s is observed; recording plan-state %q after %d of %d one-time instructions",
+		PlanCanceledAnnotation, planapi.PlanStateCancelled, existing.Completed, totalOneTimeInstructions)
+	partialCancellationLogs(existing.Completed, totalOneTimeInstructions)
 	return updates
-
 }
 
 // handlePause records a suspension by preserving a non-terminal plan state and the checkpoint from
@@ -283,12 +287,14 @@ func handlePause(currentPlanState planapi.PlanState, data map[string][]byte, che
 
 	updates := map[string][]byte{
 		planapi.PlanStateKey: []byte(PlanStatePaused),
-		PlanProgressKey: marshalPlanProgress(planProgress{
-			Checksum:    checksum,
-			Completed:   existing.Completed,
-			Total:       totalOneTimeInstructions,
-			ResumeState: resumeState,
-			Paused:      true,
+		PlanProgressKey: marshalPlanProgress(PlanProgress{
+			Checksum:  checksum,
+			Completed: existing.Completed,
+			Total:     totalOneTimeInstructions,
+			// Carried over for the same reason as in handleCancellation: no apply is in flight here.
+			TerminationIncomplete: existing.TerminationIncomplete,
+			ResumeState:           resumeState,
+			Paused:                true,
 		}),
 	}
 	logrus.Infof("[k8splan] %s is set; holding the plan at %d of %d one-time instructions, to resume into plan-state %q",

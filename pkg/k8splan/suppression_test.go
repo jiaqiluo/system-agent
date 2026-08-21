@@ -124,13 +124,13 @@ type suppressionRow struct {
 	name       string
 	annotation string // defaults to PlanPausedAnnotation
 	planState  planapi.PlanState
-	checkpoint *planProgress // nil: no checkpoint at all
+	checkpoint *PlanProgress // nil: no checkpoint at all
 
 	// The fields below describe the valid-value pass only; the invalid-value pass asserts a
 	// single stricter outcome that is identical on every row.
 	wantUpdates    int
 	wantState      planapi.PlanState
-	wantCheckpoint *planProgress // consulted only when wantUpdates > 0
+	wantCheckpoint *PlanProgress // consulted only when wantUpdates > 0
 }
 
 func (r suppressionRow) annotationKey() string {
@@ -166,7 +166,7 @@ func suppressionMatrix() []suppressionRow {
 		{
 			name:           "paused with a suspended checkpoint: the ordinary held plan",
 			planState:      PlanStatePaused,
-			checkpoint:     &planProgress{Completed: 2, Total: 3, ResumeState: planapi.PlanStateInProgress, Paused: true},
+			checkpoint:     &PlanProgress{Completed: 2, Total: 3, ResumeState: planapi.PlanStateInProgress, Paused: true},
 			wantUpdates:    0, // the write-once guard honoring a checkpoint this process did not write
 			wantState:      PlanStatePaused,
 			wantCheckpoint: nil,
@@ -178,7 +178,7 @@ func suppressionMatrix() []suppressionRow {
 			wantState:   PlanStatePaused,
 			// ResumeState is deliberately empty: resuming *into* paused is a permanent stall, so
 			// handlePause refuses to record it and lets resolveResume's in-progress default win.
-			wantCheckpoint: &planProgress{Completed: 0, Total: 3, ResumeState: "", Paused: true},
+			wantCheckpoint: &PlanProgress{Completed: 0, Total: 3, ResumeState: "", Paused: true},
 		},
 		{
 			// The contract that must NOT fire while the plan is held. An agent that restarts and
@@ -187,7 +187,7 @@ func suppressionMatrix() []suppressionRow {
 			planState:      planapi.PlanStateInProgress,
 			wantUpdates:    1,
 			wantState:      PlanStatePaused,
-			wantCheckpoint: &planProgress{Completed: 0, Total: 3, ResumeState: planapi.PlanStateInProgress, Paused: true},
+			wantCheckpoint: &PlanProgress{Completed: 0, Total: 3, ResumeState: planapi.PlanStateInProgress, Paused: true},
 		},
 		{
 			// plan-state and the checkpoint disagree. Pause's write-once guard keys off the
@@ -195,7 +195,7 @@ func suppressionMatrix() []suppressionRow {
 			// nothing is written and the wire state is left exactly as found.
 			name:        "in-progress with a suspended checkpoint: the write-once guard keys off the checkpoint, not plan-state",
 			planState:   planapi.PlanStateInProgress,
-			checkpoint:  &planProgress{Completed: 2, Total: 3, ResumeState: planapi.PlanStateInProgress, Paused: true},
+			checkpoint:  &PlanProgress{Completed: 2, Total: 3, ResumeState: planapi.PlanStateInProgress, Paused: true},
 			wantUpdates: 0,
 			wantState:   planapi.PlanStateInProgress,
 		},
@@ -204,7 +204,7 @@ func suppressionMatrix() []suppressionRow {
 			planState:      planapi.PlanStatePending,
 			wantUpdates:    1,
 			wantState:      PlanStatePaused,
-			wantCheckpoint: &planProgress{Completed: 0, Total: 3, ResumeState: planapi.PlanStatePending, Paused: true},
+			wantCheckpoint: &PlanProgress{Completed: 0, Total: 3, ResumeState: planapi.PlanStatePending, Paused: true},
 		},
 		{
 			// Terminal: there is nothing to suppress here, so this row asserts no regression
@@ -214,17 +214,17 @@ func suppressionMatrix() []suppressionRow {
 			planState:      planapi.PlanStateSucceeded,
 			wantUpdates:    1,
 			wantState:      PlanStatePaused,
-			wantCheckpoint: &planProgress{Completed: 0, Total: 3, ResumeState: planapi.PlanStateSucceeded, Paused: true},
+			wantCheckpoint: &PlanProgress{Completed: 0, Total: 3, ResumeState: planapi.PlanStateSucceeded, Paused: true},
 		},
 		{
 			// A cancel report carries Paused: false, so it is NOT an already-recorded suspension:
 			// the pause is recorded on top of it, keeping the report's Completed.
 			name:           "canceled with a cancel report: a report is not a suspension",
 			planState:      planapi.PlanStateCanceled,
-			checkpoint:     &planProgress{Completed: 2, Total: 3},
+			checkpoint:     &PlanProgress{Completed: 2, Total: 3},
 			wantUpdates:    1,
 			wantState:      PlanStatePaused,
-			wantCheckpoint: &planProgress{Completed: 2, Total: 3, ResumeState: planapi.PlanStateCanceled, Paused: true},
+			wantCheckpoint: &PlanProgress{Completed: 2, Total: 3, ResumeState: planapi.PlanStateCanceled, Paused: true},
 		},
 		{
 			// Cancel's write-once guard, which keys off the terminal plan-state rather than off
@@ -240,7 +240,7 @@ func suppressionMatrix() []suppressionRow {
 			name:        "succeeded then canceled: cancel's write-once guard keys off the terminal plan-state",
 			annotation:  PlanCanceledAnnotation,
 			planState:   planapi.PlanStateSucceeded,
-			checkpoint:  &planProgress{Completed: 2, Total: 3},
+			checkpoint:  &PlanProgress{Completed: 2, Total: 3},
 			wantUpdates: 0,
 			wantState:   planapi.PlanStateSucceeded,
 		},
@@ -524,7 +524,7 @@ func TestRestartThenUnpauseResumesAtTheCheckpoint(t *testing.T) {
 			// A plan held at instruction 2 by a previous agent lifetime.
 			secret := newInterruptTestSecret(planBytes, release.annotations, map[string][]byte{
 				planapi.PlanStateKey: []byte(PlanStatePaused),
-				PlanProgressKey: marshalPlanProgress(planProgress{
+				PlanProgressKey: marshalPlanProgress(PlanProgress{
 					Checksum: checksum, Completed: 2, Total: 3, ResumeState: planapi.PlanStateInProgress, Paused: true,
 				}),
 			})
@@ -622,7 +622,7 @@ func TestOnlyASuspendedCheckpointGrantsAResume(t *testing.T) {
 			secret := newInterruptTestSecret(f.planBytes, nil, map[string][]byte{
 				planapi.PlanStateKey: []byte(tt.planState),
 				// Paused: false — deliberately claiming progress that must NOT be honored.
-				PlanProgressKey: marshalPlanProgress(planProgress{Checksum: f.checksum, Completed: 2, Total: 3}),
+				PlanProgressKey: marshalPlanProgress(PlanProgress{Checksum: f.checksum, Completed: 2, Total: 3}),
 			})
 			rec := newInterruptRecorder(secret)
 			sc := newInterruptTestController(t, rec)
@@ -691,7 +691,7 @@ func TestCorrectedAnnotationValueSelfHeals(t *testing.T) {
 	if got := planapi.PlanState(writes[0].Data[planapi.PlanStateKey]); got != PlanStatePaused {
 		t.Errorf("expected plan-state %q, got %q", PlanStatePaused, got)
 	}
-	wantHeld := planProgress{Checksum: f.checksum, Completed: 0, Total: 3, ResumeState: planapi.PlanStateInProgress, Paused: true}
+	wantHeld := PlanProgress{Checksum: f.checksum, Completed: 0, Total: 3, ResumeState: planapi.PlanStateInProgress, Paused: true}
 	if got := checkpointIn(t, writes[0].Data); got != wantHeld {
 		t.Errorf("expected the suspension to be recorded as %+v, got %+v", wantHeld, got)
 	}
@@ -745,7 +745,7 @@ func TestResumeThenPauseAgainRecordsTheNewerCheckpoint(t *testing.T) {
 	// Held at instruction 1 by a previous pause, and just released.
 	secret := newInterruptTestSecret(planBytes, nil, map[string][]byte{
 		planapi.PlanStateKey: []byte(PlanStatePaused),
-		PlanProgressKey: marshalPlanProgress(planProgress{
+		PlanProgressKey: marshalPlanProgress(PlanProgress{
 			Checksum: checksum, Completed: 1, Total: 3, ResumeState: planapi.PlanStateInProgress, Paused: true,
 		}),
 	})
@@ -777,7 +777,7 @@ func TestResumeThenPauseAgainRecordsTheNewerCheckpoint(t *testing.T) {
 	if got := planapi.PlanState(result.Data[planapi.PlanStateKey]); got != PlanStatePaused {
 		t.Errorf("expected plan-state %q after the second pause, got %q", PlanStatePaused, got)
 	}
-	want := planProgress{Checksum: checksum, Completed: 2, Total: 3, ResumeState: planapi.PlanStateInProgress, Paused: true}
+	want := PlanProgress{Checksum: checksum, Completed: 2, Total: 3, ResumeState: planapi.PlanStateInProgress, Paused: true}
 	if got := checkpointIn(t, result.Data); got != want {
 		t.Errorf("expected the second checkpoint to report the NEWER position %+v — successive pause/resume cycles must "+
 			"compose, not reset — got %+v", want, got)
@@ -818,7 +818,7 @@ func TestInterruptPathReEntryIsANoOp(t *testing.T) {
 		planapi.PlanStateKey: []byte(planapi.PlanStateInProgress),
 		// Real progress a previous apply recorded, carrying Paused: false — a report, not a
 		// suspension, so the first reconcile has something to record.
-		PlanProgressKey:  marshalPlanProgress(planProgress{Checksum: f.checksum, Completed: 2, Total: 3}),
+		PlanProgressKey:  marshalPlanProgress(PlanProgress{Checksum: f.checksum, Completed: 2, Total: 3}),
 		ProbeStatusesKey: []byte("{}"),
 	})
 	rec := newInterruptRecorder(secret)
@@ -842,7 +842,7 @@ func TestInterruptPathReEntryIsANoOp(t *testing.T) {
 	if got := len(rec.writes()); got != 1 {
 		t.Errorf("expected exactly one Update across BOTH reconciles; the re-entry must be a complete no-op, got %d", got)
 	}
-	want := planProgress{Checksum: f.checksum, Completed: 2, Total: 3, ResumeState: planapi.PlanStateInProgress, Paused: true}
+	want := PlanProgress{Checksum: f.checksum, Completed: 2, Total: 3, ResumeState: planapi.PlanStateInProgress, Paused: true}
 	if got := checkpointIn(t, result.Data); got != want {
 		t.Errorf("expected the re-entry to leave the checkpoint exactly as the first reconcile wrote it, %+v, got %+v", want, got)
 	}
@@ -947,7 +947,7 @@ func TestInterruptedApplyOutcomeSurvivesAConflictingWrite(t *testing.T) {
 	}
 	// The actual regression: Completed must survive the conflict. Losing it means unpause re-runs
 	// the plan from instruction 0, silently defeating the feature.
-	want := planProgress{Checksum: checksum, Completed: 1, Total: 2, ResumeState: planapi.PlanStateInProgress, Paused: true}
+	want := PlanProgress{Checksum: checksum, Completed: 1, Total: 2, ResumeState: planapi.PlanStateInProgress, Paused: true}
 	if got := checkpointIn(t, result.Data); got != want {
 		t.Errorf("expected the checkpoint %+v to survive the conflicting write, got %+v", want, got)
 	}
@@ -1040,7 +1040,7 @@ func TestHandEditedResumeStateMarksThePlanAppliedWithoutRunningIt(t *testing.T) 
 		// what Part 1's "succeeded with no checkpoint" row asserts handlePause writes. Nothing is
 		// forged here; what has been mutilated is plan-state, moved out from under the checkpoint
 		// to a non-terminal value that the agent itself would never pair with this record.
-		PlanProgressKey: marshalPlanProgress(planProgress{
+		PlanProgressKey: marshalPlanProgress(PlanProgress{
 			Checksum: f.checksum, Completed: 0, Total: 3, ResumeState: planapi.PlanStateSucceeded, Paused: true,
 		}),
 	})

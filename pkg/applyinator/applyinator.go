@@ -62,6 +62,17 @@ const defaultFailureCooldown = 6
 // escalation path without waiting the full default duration.
 var instructionTerminationGrace = 10 * time.Second
 
+// processTreeExitTimeout bounds the final confirmation that a terminated instruction's process tree
+// is really gone. It is spent only after the tree has already been signaled and killed, so reaching
+// it means the processes are not responding to SIGKILL rather than that they need more time.
+//
+// A variable for the same reason as instructionTerminationGrace.
+var processTreeExitTimeout = 5 * time.Second
+
+// processTreeExitPollInterval is how often processTreeExited re-checks whether a signaled process
+// tree has gone away.
+var processTreeExitPollInterval = 50 * time.Millisecond
+
 func NewApplyinator(workDir string, preserveWorkDir bool, appliedPlanDir, interlockDir string, imageUtil *image.Utility) *Applyinator {
 	return &Applyinator{
 		mu:              &sync.Mutex{},
@@ -127,6 +138,15 @@ type ApplyOutput struct {
 	// across the entire plan, not the number completed by this apply. This allows successive
 	// pause/resume cycles to preserve and build on the same checkpoint.
 	CompletedOneTimeInstructions int
+	// TerminationIncomplete reports that an instruction was terminated because the apply was
+	// interrupted, but processes from its process tree were still running once the agent gave up on
+	// them. The apply is over either way; what this says is that the node is not necessarily quiescent,
+	// so work started by the abandoned plan may still be mutating it.
+	//
+	// It can only be a lower bound. Descendants that left the instruction's process group cannot be
+	// signaled or observed, so false means "nothing unterminated was detected" rather than "nothing
+	// survived".
+	TerminationIncomplete bool
 }
 
 type ApplyInput struct {
@@ -242,6 +262,7 @@ func (a *Applyinator) Apply(ctx context.Context, input ApplyInput) (ApplyOutput,
 		output.OneTimeOutput = oneTime.Output
 		output.OneTimeApplySucceeded = oneTime.Succeeded
 		output.CompletedOneTimeInstructions = oneTime.Completed
+		output.TerminationIncomplete = oneTime.TerminationIncomplete
 		if oneTime.Interruption != InterruptionNone {
 			// An interrupt suppresses periodic instructions as well. Once the operator has stopped the apply,
 			// no additional work should start after the one-time instructions are abandoned.
@@ -250,13 +271,16 @@ func (a *Applyinator) Apply(ctx context.Context, input ApplyInput) (ApplyOutput,
 		}
 	}
 
-	periodicOutput, periodicSucceeded, err := a.runPeriodicInstructions(execCtx, executionDir, input.CalculatedPlan,
+	periodic, err := a.runPeriodicInstructions(execCtx, executionDir, input.CalculatedPlan,
 		input.ExistingPeriodicOutput, input.RunOneTimeInstructions, now, input.Cancel, input.Pause)
 	if err != nil {
 		return output, err
 	}
-	output.PeriodicOutput = periodicOutput
-	output.PeriodicApplySucceeded = periodicSucceeded
+	output.PeriodicOutput = periodic.Output
+	output.PeriodicApplySucceeded = periodic.Succeeded
+	// Never clear a report the one-time pass already made: the two passes terminate different
+	// instructions, and only one of them needs to have left something behind.
+	output.TerminationIncomplete = output.TerminationIncomplete || periodic.TerminationIncomplete
 	// Periodic instructions have no checkpoint, so their interruption is only observable here.
 	if output.Interruption == InterruptionNone {
 		output.Interruption = checkInterruption(input.Cancel, input.Pause)
@@ -376,6 +400,16 @@ type oneTimeResult struct {
 	Completed int
 	// Interruption is InterruptionNone unless execution stopped before all instructions completed.
 	Interruption Interruption
+	// TerminationIncomplete mirrors ApplyOutput.TerminationIncomplete for this pass.
+	TerminationIncomplete bool
+}
+
+// periodicResult is the outcome of one pass over a plan's periodic instructions.
+type periodicResult struct {
+	Output    []byte
+	Succeeded bool
+	// TerminationIncomplete mirrors ApplyOutput.TerminationIncomplete for this pass.
+	TerminationIncomplete bool
 }
 
 // runOneTimeInstructions executes one-time instructions in order, starting at resumeFrom. It stops
@@ -406,8 +440,11 @@ func (a *Applyinator) runOneTimeInstructions(ctx context.Context, executionDir s
 		instruction := cp.Plan.OneTimeInstructions[index]
 		logrus.Debugf("[applyinator] executing instruction %d attempt %d for plan %s", index, attempts, cp.Checksum)
 		instructionDir, prefix := instructionExecutionDir(executionDir, cp.Checksum, index)
-		executeOutput, _, exitCode, err := a.execute(ctx, prefix, instructionDir, instruction.CommonInstruction, true, attempts)
-		failed := err != nil || exitCode != 0
+		executed, err := a.execute(ctx, prefix, instructionDir, instruction.CommonInstruction, true, attempts)
+		if executed.TerminationIncomplete {
+			result.TerminationIncomplete = true
+		}
+		failed := err != nil || executed.ExitCode != 0
 		if failed {
 			logrus.Errorf("[applyinator] error executing instruction %d: %v", index, err)
 			result.Succeeded = false
@@ -416,7 +453,7 @@ func (a *Applyinator) runOneTimeInstructions(ctx context.Context, executionDir s
 		if instruction.Name == "" && instruction.SaveOutput {
 			logrus.Errorf("[applyinator] instruction does not have a name set, cannot save output data")
 		} else if instruction.SaveOutput {
-			executionOutputs[instruction.Name] = executeOutput
+			executionOutputs[instruction.Name] = executed.Stdout
 		}
 		// Stop after the first failed instruction; subsequent instructions must not execute.
 		if failed {
@@ -447,15 +484,15 @@ func (a *Applyinator) runOneTimeInstructions(ctx context.Context, executionDir s
 // stops before the next instruction, and the caller re-checks the interruption channels to determine
 // whether the apply was interrupted.
 func (a *Applyinator) runPeriodicInstructions(ctx context.Context, executionDir string, cp CalculatedPlan, existingOutput []byte,
-	ranOneTime bool, now time.Time, cancel, pause <-chan struct{}) ([]byte, bool, error) {
+	ranOneTime bool, now time.Time, cancel, pause <-chan struct{}) (periodicResult, error) {
 	nowUnixTimeString := now.Format(time.UnixDate)
 
 	periodicOutputs := map[string]planapi.PeriodicInstructionOutput{}
 	if err := decodeGzipJSON(existingOutput, &periodicOutputs); err != nil {
-		return nil, false, err
+		return periodicResult{}, err
 	}
 
-	periodicApplySucceeded := true
+	result := periodicResult{Succeeded: true}
 	for index, instruction := range cp.Plan.PeriodicInstructions {
 		if interruption := checkInterruption(cancel, pause); interruption != InterruptionNone {
 			logrus.Infof("[applyinator] plan %s %s before periodic instruction %d; not executing it", cp.Checksum, interruption, index)
@@ -481,14 +518,17 @@ func (a *Applyinator) runPeriodicInstructions(ctx context.Context, executionDir 
 
 		logrus.Debugf("[applyinator] executing periodic instruction %d for plan %s", index, cp.Checksum)
 		instructionDir, prefix := instructionExecutionDir(executionDir, cp.Checksum, index)
-		stdout, stderr, exitCode, err := a.execute(ctx, prefix, instructionDir, instruction.CommonInstruction, false, failures+1)
-		if err != nil || exitCode != 0 {
-			periodicApplySucceeded = false
+		executed, err := a.execute(ctx, prefix, instructionDir, instruction.CommonInstruction, false, failures+1)
+		if executed.TerminationIncomplete {
+			result.TerminationIncomplete = true
+		}
+		if err != nil || executed.ExitCode != 0 {
+			result.Succeeded = false
 		}
 
 		lsrt := nowUnixTimeString
 		lastFailureTime := ""
-		if exitCode != 0 {
+		if executed.ExitCode != 0 {
 			lsrt = previousRunTime
 			lastFailureTime = nowUnixTimeString
 			failures++
@@ -496,28 +536,30 @@ func (a *Applyinator) runPeriodicInstructions(ctx context.Context, executionDir 
 			// reset last failure time and failure count
 			failures = 0
 		}
+		stderr := executed.Stderr
 		if !instruction.SaveStderrOutput {
 			stderr = []byte{}
 		}
 		periodicOutputs[instruction.Name] = planapi.PeriodicInstructionOutput{
 			Name:                  instruction.Name,
-			Stdout:                stdout,
+			Stdout:                executed.Stdout,
 			Stderr:                stderr,
-			ExitCode:              exitCode,
+			ExitCode:              executed.ExitCode,
 			LastSuccessfulRunTime: lsrt,
 			LastFailedRunTime:     lastFailureTime,
 			Failures:              failures,
 		}
-		if !periodicApplySucceeded {
+		if !result.Succeeded {
 			break
 		}
 	}
 
 	output, err := encodeGzipJSON(periodicOutputs)
 	if err != nil {
-		return nil, false, err
+		return periodicResult{}, err
 	}
-	return output, periodicApplySucceeded, nil
+	result.Output = output
+	return result, nil
 }
 
 // checkInterlock enforces the interlock directory protocol used by install.sh during agent upgrade.
@@ -677,15 +719,25 @@ func (a *Applyinator) writePlanToDisk(now time.Time, plan *CalculatedPlan) error
 	return writeContentToFile(filepath.Join(a.appliedPlanDir, file), os.Getuid(), os.Getgid(), 0600, anpString)
 }
 
-// execute stages the instruction's execution directory, runs its command, and returns captured
-// stdout, stderr, the exit code, and any wait error.
+// executeResult is the outcome of running a single instruction's command.
+type executeResult struct {
+	Stdout   []byte
+	Stderr   []byte
+	ExitCode int
+	// TerminationIncomplete mirrors ApplyOutput.TerminationIncomplete for this instruction.
+	TerminationIncomplete bool
+}
+
+// execute stages the instruction's execution directory, runs its command, and returns an
+// executeResult alongside any wait error.
 //
 // The command runs in its own process group on Unix or Job Object on Windows. A watchdog monitors
 // ctx and, when canceled, signals the entire process tree to terminate. If the tree does not exit
 // within instructionTerminationGrace, it is killed. Signaling the whole tree prevents child
 // processes such as installers or package managers launched by a shell script from surviving
-// cancellation.
-func (a *Applyinator) execute(ctx context.Context, prefix, executionDir string, instruction planapi.CommonInstruction, combinedOutput bool, attempt int) ([]byte, []byte, int, error) {
+// cancellation. Killing is a request rather than an outcome, so the tree is then confirmed to be
+// empty; executeResult.TerminationIncomplete reports a tree that could not be confirmed gone.
+func (a *Applyinator) execute(ctx context.Context, prefix, executionDir string, instruction planapi.CommonInstruction, combinedOutput bool, attempt int) (executeResult, error) {
 	if instruction.Image == "" {
 		logrus.Infof("[applyinator] no image provided, creating empty working directory %s", executionDir)
 		// UID/GID -1 means "leave ownership unchanged". This avoids requiring root when tests run
@@ -693,13 +745,13 @@ func (a *Applyinator) execute(ctx context.Context, prefix, executionDir string, 
 		// existing ownership.
 		if err := createDirectory(planapi.File{Directory: true, Path: executionDir, UID: -1, GID: -1}); err != nil {
 			logrus.Errorf("[applyinator] error while creating empty working directory: %v", err)
-			return nil, nil, -1, err
+			return executeResult{ExitCode: -1}, err
 		}
 	} else {
 		logrus.Infof("[applyinator] extracting image %s to directory %s", instruction.Image, executionDir)
 		if err := a.imageUtil.Stage(executionDir, instruction.Image); err != nil {
 			logrus.Errorf("[applyinator] error while staging: %v", err)
-			return nil, nil, -1, err
+			return executeResult{ExitCode: -1}, err
 		}
 	}
 
@@ -722,14 +774,14 @@ func (a *Applyinator) execute(ctx context.Context, prefix, executionDir string, 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		logrus.Errorf("[applyinator] error setting up stdout pipe: %v", err)
-		return nil, nil, -1, err
+		return executeResult{ExitCode: -1}, err
 	}
 	defer stdout.Close()
 
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
 		logrus.Errorf("[applyinator] error setting up stderr pipe: %v", err)
-		return nil, nil, -1, err
+		return executeResult{ExitCode: -1}, err
 	}
 	defer stderr.Close()
 
@@ -773,7 +825,7 @@ func (a *Applyinator) execute(ctx context.Context, prefix, executionDir string, 
 		// The watchdog has not started yet, so release any process-tree handle created during setup.
 		// releaseProcessTree is idempotent and does nothing if no handle was recorded.
 		releaseProcessTree(cmd)
-		return nil, nil, -1, err
+		return executeResult{ExitCode: -1}, err
 	}
 
 	// Windows assigns the process to its Job Object only after the process starts. If assignment
@@ -799,8 +851,18 @@ func (a *Applyinator) execute(ctx context.Context, prefix, executionDir string, 
 			exitCode = ee.ExitCode()
 		}
 	}
+	// Stop the watchdog here rather than leaving it to the deferred call. stop() decides whether the
+	// process tree really went away, and that question can only be answered once cmd.Wait() has reaped
+	// the direct child, because an unreaped zombie is still a member of its own process group.
+	terminationIncomplete := stop()
+
 	logrus.Infof("[applyinator] command %s %v finished with err: %v and exit code: %d", instruction.Command, instruction.Args, waitErr, exitCode)
-	return stdoutTarget.Bytes(), stderrTarget.Bytes(), exitCode, waitErr
+	return executeResult{
+		Stdout:                stdoutTarget.Bytes(),
+		Stderr:                stderrTarget.Bytes(),
+		ExitCode:              exitCode,
+		TerminationIncomplete: terminationIncomplete,
+	}, waitErr
 }
 
 // watchForTermination monitors ctx and terminates cmd's process tree when cancellation occurs.
@@ -808,14 +870,30 @@ func (a *Applyinator) execute(ctx context.Context, prefix, executionDir string, 
 // within instructionTerminationGrace. Pipes are closed only after forced termination so that
 // streamLogs cannot remain blocked on descendants that inherited the pipe handles.
 //
-// The returned function stops the watchdog and releases any platform-specific process-tree
-// handles. Callers must defer it.
-func watchForTermination(ctx context.Context, cmd *exec.Cmd, pipes ...io.Closer) func() {
+// The returned function stops the watchdog, releases any platform-specific process-tree handles, and
+// reports whether processes from the tree were still running once the agent gave up on them. It is
+// always false when the instruction was never terminated. Callers must defer it, and should call it
+// explicitly after cmd.Wait() when they care about the return value: the tree cannot be confirmed
+// empty until the direct child has been reaped.
+func watchForTermination(ctx context.Context, cmd *exec.Cmd, pipes ...io.Closer) func() bool {
 	// done is closed by the returned stop function; finished is closed when the watchdog exits.
 	// Waiting for finished ensures all termination work is complete before process-tree handles are
 	// released.
 	done := make(chan struct{})
 	finished := make(chan struct{})
+	// terminated is written by the watchdog goroutine before it closes finished and is read only after
+	// a receive from finished has succeeded. The channel close provides the happens-before edge, so no
+	// additional synchronization is needed. incomplete is only ever touched inside once.Do.
+	terminated := false
+	incomplete := false
+
+	// Read here rather than in the watchdog so both it and the stop function report the same pid without
+	// racing cmd.Wait(). Callers invoke this after a successful cmd.Start(), so Process is set; the guard
+	// only keeps the log honest if that ever stops being true.
+	pid := -1
+	if cmd.Process != nil {
+		pid = cmd.Process.Pid
+	}
 
 	go func() {
 		defer close(finished)
@@ -826,25 +904,29 @@ func watchForTermination(ctx context.Context, cmd *exec.Cmd, pipes ...io.Closer)
 			return
 		case <-ctx.Done():
 		}
-
-		pid := -1
-		if cmd.Process != nil {
-			pid = cmd.Process.Pid
-		}
+		terminated = true
 
 		logrus.Infof("[applyinator] apply was canceled, terminating the process tree of pid %d", pid)
 		if err := terminateProcessTree(cmd); err != nil {
 			logrus.Warnf("[applyinator] error terminating the process tree of pid %d: %v", pid, err)
 		}
 
-		// Wait for either the process to finish or the grace period to expire. execute defers stop(),
-		// which closes done after cmd.Wait() returns, so a process that exits promptly avoids waiting
-		// out the full grace period. This also handles platforms where terminateProcessTree kills the
-		// tree immediately, such as Windows, where no graceful signal is available.
+		// Wait for either the process to finish or the grace period to expire. execute closes done after
+		// cmd.Wait() returns, so a process that exits promptly avoids waiting out the full grace period.
+		// This also handles platforms where terminateProcessTree kills the tree immediately, such as
+		// Windows, where no graceful signal is available.
+		graceDeadline := time.Now().Add(instructionTerminationGrace)
 		select {
 		case <-done:
-			// The tree is gone: either it took the hint, or terminateProcessTree killed it outright.
-			return
+			// The direct child is gone: either it took the hint, or terminateProcessTree killed it
+			// outright. That is not the same as the tree being gone, and because done is only closed
+			// after cmd.Wait() has reaped the child, whatever the group still contains is a survivor
+			// rather than an unreaped zombie. Give the rest of the tree the remainder of the grace
+			// period before escalating.
+			if processTreeExited(cmd, graceDeadline) {
+				return
+			}
+			logrus.Warnf("[applyinator] pid %d exited but processes from its process tree are still running", pid)
 		case <-time.After(instructionTerminationGrace):
 		}
 
@@ -864,12 +946,25 @@ func watchForTermination(ctx context.Context, cmd *exec.Cmd, pipes ...io.Closer)
 	}()
 
 	var once sync.Once
-	return func() {
+	return func() bool {
 		once.Do(func() {
 			close(done)
 			<-finished
+			if terminated {
+				// The tree was signaled and, if it did not comply, killed. Confirm it is actually gone
+				// before the caller reports the instruction as terminated. This is deliberately the last
+				// thing done before the handles are released: on Unix the process group cannot be
+				// distinguished from its own unreaped leader, so this is only meaningful after the caller
+				// has run cmd.Wait().
+				incomplete = !processTreeExited(cmd, time.Now().Add(processTreeExitTimeout))
+				if incomplete {
+					logrus.Warnf("[applyinator] processes from the terminated process tree of pid %d were still running %s after it was killed; "+
+						"the node may still be modified by the abandoned instruction", pid, processTreeExitTimeout)
+				}
+			}
 			releaseProcessTree(cmd)
 		})
+		return incomplete
 	}
 }
 
