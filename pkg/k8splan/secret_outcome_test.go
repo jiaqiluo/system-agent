@@ -191,7 +191,7 @@ func TestBuildSecretDataUpdatesAlwaysClearsThePlanProgressCheckpoint(t *testing.
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			got, _ := buildSecretDataUpdates(tt.in)
+			got := buildSecretDataUpdates(tt.in)
 			value, ok := got[PlanProgressKey]
 			if !tt.wantCleared {
 				if ok {

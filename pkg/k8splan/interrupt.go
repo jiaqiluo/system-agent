@@ -241,7 +241,7 @@ func handleCancellation(currentPlanState planapi.PlanState, data map[string][]by
 
 	existing := parsePlanProgress(data, checksum)
 	updates := map[string][]byte{
-		planapi.PlanStateKey: []byte(planapi.PlanStateCancelled),
+		planapi.PlanStateKey: []byte(planapi.PlanStateCanceled),
 		PlanProgressKey: marshalPlanProgress(PlanProgress{
 			Checksum:  checksum,
 			Completed: existing.Completed,
@@ -255,7 +255,7 @@ func handleCancellation(currentPlanState planapi.PlanState, data map[string][]by
 		}),
 	}
 	logrus.Infof("[k8splan] %s is observed; recording plan-state %q after %d of %d one-time instructions",
-		PlanCanceledAnnotation, planapi.PlanStateCancelled, existing.Completed, totalOneTimeInstructions)
+		PlanCanceledAnnotation, planapi.PlanStateCanceled, existing.Completed, totalOneTimeInstructions)
 	partialCancellationLogs(existing.Completed, totalOneTimeInstructions)
 	return updates
 }

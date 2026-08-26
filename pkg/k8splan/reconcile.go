@@ -410,7 +410,7 @@ func (w *watcher) recordInterruptAfterApply(sc corecontrollers.SecretController,
 	progress.Paused = true
 	if applyOutput.Interruption == applyinator.InterruptionCanceled {
 		// A cancellation is a report, not a suspension: nothing resumes from it.
-		state = planapi.PlanStateCancelled
+		state = planapi.PlanStateCanceled
 		progress.Paused = false
 		progress.ResumeState = ""
 		partialCancellationLogs(progress.Completed, progress.Total)
