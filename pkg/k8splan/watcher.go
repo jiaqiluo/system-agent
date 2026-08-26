@@ -62,11 +62,38 @@ const (
 
 	enqueueAfterDuration  = "5s"
 	cooldownTimerDuration = "30s"
+
+	// TODO: upstream these into github.com/rancher/rancher/pkg/plan alongside PlanStateCanceled,
+	// then drop the local definitions and bump the dependency.
+
+	// PlanCanceledAnnotation is the Secret annotation used to cancel a plan.
+	// Setting it to "true" requests that the agent abort the plan.
+	// Removing the annotation does not resume the plan: cancellation is terminal and requires new content.
+	// The only valid values are "true" and "false".
+	PlanCanceledAnnotation = "plan.cattle.io/canceled"
+
+	// PlanPausedAnnotation is the Secret annotation used to pause a plan.
+	// Setting it to "true" requests that the agent stop executing the plan.
+	// While set, the agent performs no plan execution regardless of plan state or resume checkpoint.
+	// Clearing the annotation or setting it to "false" resumes the plan.
+	// The only valid values are "true" and "false".
+	PlanPausedAnnotation = "plan.cattle.io/paused"
+
+	// PlanStatePaused is a non-terminal state where execution is held at an instruction boundary.
+	// Removing the paused annotation resumes execution using PlanProgress.ResumeState.
+	PlanStatePaused planapi.PlanState = "paused"
+
+	// PlanProgressKey is the Secret data key holding the resume checkpoint.
+	PlanProgressKey = "plan-progress"
 )
 
 // secretConflictMergeKeys lists Secret data keys that updateSecret merges on conflict.
 // When retrying after an Update conflict, these keys are carried from the attempted write
 // into the freshly fetched secret before retrying the Update.
+//
+// These keys must be cleared by writing an empty value rather than deleting the key. The conflict
+// merge only carries forward keys present in the in-hand copy, so deleting a key would leave the
+// freshly fetched Secret's stale value intact and silently lose the clear during the retry.
 var secretConflictMergeKeys = []string{
 	ProbeStatusesKey,
 	AppliedPeriodicOutputKey,
@@ -79,6 +106,7 @@ var secretConflictMergeKeys = []string{
 	AppliedOutputKey,
 	planapi.PlanStateKey,
 	planapi.PlanRevisionKey,
+	PlanProgressKey,
 }
 
 func Watch(ctx context.Context, applyinator applyinator.Applyinator, connInfo config.ConnectionInfo, strictVerify bool) {
@@ -193,8 +221,15 @@ func (w *watcher) updateSecret(sc corecontrollers.SecretController, secret *core
 						if ck.Checksum == string(secret.Data[AppliedChecksumKey]) {
 							logrus.Debugf("[k8splan] secret %s/%s resource version changed from %s to %s but plan checksum still matches, updating latest secret", secret.Namespace, secret.Name, secret.ResourceVersion, latestSecret.ResourceVersion)
 							// we can go ahead copy the relevant data out of the "old" secret and return true to let it update the secret.
+							if latestSecret.Data == nil {
+								latestSecret.Data = map[string][]byte{}
+							}
 							for _, key := range secretConflictMergeKeys {
-								latestSecret.Data[key] = secret.Data[key]
+								// Only carry over keys present in the in-hand copy. A key the agent did not write must not be
+								// introduced as an empty value into the freshly fetched object.
+								if v, ok := secret.Data[key]; ok {
+									latestSecret.Data[key] = v
+								}
 							}
 							secret = latestSecret
 							latestSecretUpdateAttempted = true

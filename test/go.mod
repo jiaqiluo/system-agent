@@ -1,8 +1,6 @@
 module github.com/rancher/system-agent/test
 
-go 1.26.0
-
-toolchain go1.26.6
+go 1.26.6
 
 replace (
 	github.com/rancher/system-agent => ../
@@ -143,7 +141,7 @@ require (
 	github.com/rancher/lasso v0.2.9 // indirect
 	github.com/rancher/permissions v0.0.0-20240924180251-69b0dcb34065 // indirect
 	github.com/rancher/wharfie v0.7.1-0.20251014190711-8cfe84a9efaa // indirect
-	github.com/rancher/wrangler/v3 v3.7.1-rc.2 // indirect
+	github.com/rancher/wrangler/v3 v3.7.1 // indirect
 	github.com/rivo/uniseg v0.4.7 // indirect
 	github.com/robfig/cron/v3 v3.0.1 // indirect
 	github.com/sagikazarmark/locafero v0.11.0 // indirect
@@ -209,7 +207,7 @@ require (
 	k8s.io/kms v0.36.3 // indirect
 	k8s.io/kube-openapi v0.0.0-20260317180543-43fb72c5454a // indirect
 	k8s.io/kubelet v0.34.0 // indirect
-	k8s.io/kubernetes v1.36.0 // indirect
+	k8s.io/kubernetes v1.36.3 // indirect
 	k8s.io/streaming v0.36.3 // indirect
 	k8s.io/utils v0.0.0-20260210185600-b8788abfbbc2 // indirect
 	sigs.k8s.io/apiserver-network-proxy/konnectivity-client v0.34.0 // indirect
