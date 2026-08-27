@@ -33,7 +33,6 @@ jobs:
       - create-draft-release
     permissions:
       contents: read # to clone the repo
-      id-token: write # to read vault secrets
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -48,98 +47,38 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Read Vault secrets
-        uses: rancher-eio/read-vault-secrets@0da85151ad1f19ed7986c41587e45aac1ace74b6 # main
-        with:
-          secrets: |
-            secret/data/github/repo/${{ github.repository }}/dockerhub/rancher/credentials username | DOCKER_USERNAME ;
-            secret/data/github/repo/${{ github.repository }}/dockerhub/rancher/credentials password | DOCKER_PASSWORD ;
-            secret/data/github/repo/${{ github.repository }}/rancher-prime-registry/credentials registry | PRIME_REGISTRY ;
-            secret/data/github/repo/${{ github.repository }}/rancher-prime-registry/credentials username | PRIME_REGISTRY_USERNAME ;
-            secret/data/github/repo/${{ github.repository }}/rancher-prime-registry/credentials password | PRIME_REGISTRY_PASSWORD ;
-            secret/data/github/repo/${{ github.repository }}/rancher-prime-stg-registry/credentials registry | PRIME_STG_REGISTRY ;
-            secret/data/github/repo/${{ github.repository }}/rancher-prime-stg-registry/credentials username | PRIME_STG_REGISTRY_USERNAME ;
-            secret/data/github/repo/${{ github.repository }}/rancher-prime-stg-registry/credentials password | PRIME_STG_REGISTRY_PASSWORD
-
-      - name: Publish main image to DockerHub and Prime Staging
+      - name: Publish main image to DockerHub
         uses: rancher/ecm-distro-tools/actions/publish-image@10ab39987d39be83da6a252c1c3b540e496e0287 # master
         with:
           image: "system-agent"
           tag: ${{ github.ref_name }}-${{ matrix.tag-suffix }}
           platforms: linux/${{ matrix.arch }}
           make-target: push-image
-          prime-make-target: push-prime-image
 
           public-registry: docker.io
-          public-repo: rancher
-          public-username: ${{ env.DOCKER_USERNAME }}
-          public-password: ${{ env.DOCKER_PASSWORD }}
+          public-repo: jq20
+          public-username: ${{ secrets.DOCKER_USERNAME }}
+          public-password: ${{ secrets.DOCKER_PASSWORD }}
 
-          push-to-prime: true
-          prime-registry: ${{ env.PRIME_STG_REGISTRY }}
-          prime-repo: rancher
-          prime-username: ${{ env.PRIME_STG_REGISTRY_USERNAME }}
-          prime-password: ${{ env.PRIME_STG_REGISTRY_PASSWORD }}
+          push-to-prime: false
 
-      - name: Publish main image to Prime Prod
-        if: ${{ !contains(github.ref_name, '-rc') }}
-        uses: rancher/ecm-distro-tools/actions/publish-image@10ab39987d39be83da6a252c1c3b540e496e0287 # master
-        with:
-          image: "system-agent"
-          tag: ${{ github.ref_name }}-${{ matrix.tag-suffix }}
-          platforms: linux/${{ matrix.arch }}
-          make-target: push-image
-          prime-make-target: push-prime-image
-
-          push-to-public: false
-
-          push-to-prime: true
-          prime-registry: ${{ env.PRIME_REGISTRY }}
-          prime-repo: rancher
-          prime-username: ${{ env.PRIME_REGISTRY_USERNAME }}
-          prime-password: ${{ env.PRIME_REGISTRY_PASSWORD }}
-
-      - name: Publish SUC image to DockerHub and Prime Staging
+      - name: Publish SUC image to DockerHub
         uses: rancher/ecm-distro-tools/actions/publish-image@10ab39987d39be83da6a252c1c3b540e496e0287 # master
         with:
           image: "system-agent"
           tag: ${{ github.ref_name }}-${{ matrix.tag-suffix }}-suc
           platforms: linux/${{ matrix.arch }}
           make-target: push-image-suc
-          prime-make-target: push-prime-image-suc
 
           public-registry: docker.io
-          public-repo: rancher
-          public-username: ${{ env.DOCKER_USERNAME }}
-          public-password: ${{ env.DOCKER_PASSWORD }}
+          public-repo: jq20
+          public-username: ${{ secrets.DOCKER_USERNAME }}
+          public-password: ${{ secrets.DOCKER_PASSWORD }}
 
-          push-to-prime: true
-          prime-registry: ${{ env.PRIME_STG_REGISTRY }}
-          prime-repo: rancher
-          prime-username: ${{ env.PRIME_STG_REGISTRY_USERNAME }}
-          prime-password: ${{ env.PRIME_STG_REGISTRY_PASSWORD }}
-
-      - name: Publish SUC image to Prime Prod
-        if: ${{ !contains(github.ref_name, '-rc') }}
-        uses: rancher/ecm-distro-tools/actions/publish-image@10ab39987d39be83da6a252c1c3b540e496e0287 # master
-        with:
-          image: "system-agent"
-          tag: ${{ github.ref_name }}-${{ matrix.tag-suffix }}-suc
-          platforms: linux/${{ matrix.arch }}
-          make-target: push-image-suc
-          prime-make-target: push-prime-image-suc
-
-          push-to-public: false
-
-          push-to-prime: true
-          prime-registry: ${{ env.PRIME_REGISTRY }}
-          prime-repo: rancher
-          prime-username: ${{ env.PRIME_REGISTRY_USERNAME }}
-          prime-password: ${{ env.PRIME_REGISTRY_PASSWORD }}
+          push-to-prime: false
 
   merge:
     permissions:
-      id-token: write # to read vault secrets
       contents: read # to clone the repo
     runs-on: ubuntu-latest
     needs:
@@ -149,90 +88,33 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
 
-      - name: Read Vault secrets
-        uses: rancher-eio/read-vault-secrets@0da85151ad1f19ed7986c41587e45aac1ace74b6 # main
-        with:
-          secrets: |
-            secret/data/github/repo/${{ github.repository }}/dockerhub/rancher/credentials username | DOCKER_USERNAME ;
-            secret/data/github/repo/${{ github.repository }}/dockerhub/rancher/credentials password | DOCKER_PASSWORD ;
-            secret/data/github/repo/${{ github.repository }}/rancher-prime-registry/credentials registry | PRIME_REGISTRY ;
-            secret/data/github/repo/${{ github.repository }}/rancher-prime-registry/credentials username | PRIME_REGISTRY_USERNAME ;
-            secret/data/github/repo/${{ github.repository }}/rancher-prime-registry/credentials password | PRIME_REGISTRY_PASSWORD ;
-            secret/data/github/repo/${{ github.repository }}/rancher-prime-stg-registry/credentials registry | PRIME_STG_REGISTRY ;
-            secret/data/github/repo/${{ github.repository }}/rancher-prime-stg-registry/credentials username | PRIME_STG_REGISTRY_USERNAME ;
-            secret/data/github/repo/${{ github.repository }}/rancher-prime-stg-registry/credentials password | PRIME_STG_REGISTRY_PASSWORD
-
-      - name: Publish main manifest to DockerHub and Prime Staging
+      - name: Publish main manifest to DockerHub
         uses: rancher/ecm-distro-tools/actions/publish-image@10ab39987d39be83da6a252c1c3b540e496e0287 # master
         with:
           image: "system-agent"
           tag: ${{ github.ref_name }}
           make-target: push-manifest
-          prime-make-target: push-prime-manifest
 
           public-registry: docker.io
-          public-repo: rancher
-          public-username: ${{ env.DOCKER_USERNAME }}
-          public-password: ${{ env.DOCKER_PASSWORD }}
+          public-repo: jq20
+          public-username: ${{ secrets.DOCKER_USERNAME }}
+          public-password: ${{ secrets.DOCKER_PASSWORD }}
 
-          push-to-prime: true
-          prime-registry: ${{ env.PRIME_STG_REGISTRY }}
-          prime-repo: rancher
-          prime-username: ${{ env.PRIME_STG_REGISTRY_USERNAME }}
-          prime-password: ${{ env.PRIME_STG_REGISTRY_PASSWORD }}
+          push-to-prime: false
 
-      - name: Publish main manifest to Prime Prod
-        if: ${{ !contains(github.ref_name, '-rc') }}
-        uses: rancher/ecm-distro-tools/actions/publish-image@10ab39987d39be83da6a252c1c3b540e496e0287 # master
-        with:
-          image: "system-agent"
-          tag: ${{ github.ref_name }}
-          make-target: push-manifest
-          prime-make-target: push-prime-manifest
-
-          push-to-public: false
-
-          push-to-prime: true
-          prime-registry: ${{ env.PRIME_REGISTRY }}
-          prime-repo: rancher
-          prime-username: ${{ env.PRIME_REGISTRY_USERNAME }}
-          prime-password: ${{ env.PRIME_REGISTRY_PASSWORD }}
-
-      - name: Publish SUC manifest to DockerHub and Prime Staging
+      - name: Publish SUC manifest to DockerHub
         uses: rancher/ecm-distro-tools/actions/publish-image@10ab39987d39be83da6a252c1c3b540e496e0287 # master
         with:
           image: "system-agent"
           tag: ${{ github.ref_name }}-suc
           make-target: push-manifest-suc
-          prime-make-target: push-prime-manifest-suc
 
           public-registry: docker.io
-          public-repo: rancher
-          public-username: ${{ env.DOCKER_USERNAME }}
-          public-password: ${{ env.DOCKER_PASSWORD }}
+          public-repo: jq20
+          public-username: ${{ secrets.DOCKER_USERNAME }}
+          public-password: ${{ secrets.DOCKER_PASSWORD }}
 
-          push-to-prime: true
-          prime-registry: ${{ env.PRIME_STG_REGISTRY }}
-          prime-repo: rancher
-          prime-username: ${{ env.PRIME_STG_REGISTRY_USERNAME }}
-          prime-password: ${{ env.PRIME_STG_REGISTRY_PASSWORD }}
-
-      - name: Publish SUC manifest to Prime Prod
-        if: ${{ !contains(github.ref_name, '-rc') }}
-        uses: rancher/ecm-distro-tools/actions/publish-image@10ab39987d39be83da6a252c1c3b540e496e0287 # master
-        with:
-          image: "system-agent"
-          tag: ${{ github.ref_name }}-suc
-          make-target: push-manifest-suc
-          prime-make-target: push-prime-manifest-suc
-
-          push-to-public: false
-
-          push-to-prime: true
-          prime-registry: ${{ env.PRIME_REGISTRY }}
-          prime-repo: rancher
-          prime-username: ${{ env.PRIME_REGISTRY_USERNAME }}
-          prime-password: ${{ env.PRIME_REGISTRY_PASSWORD }}
+          push-to-prime: false
 
   github_release:
     name: Finalize GitHub release
@@ -243,7 +125,6 @@ jobs:
       - release
     permissions:
       contents: write
-      id-token: write
     steps:
       - name: Checkout code
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
