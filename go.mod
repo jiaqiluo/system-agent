@@ -177,5 +177,3 @@ require (
 	sigs.k8s.io/randfill v1.0.0 // indirect
 	sigs.k8s.io/structured-merge-diff/v6 v6.3.3 // indirect
 )
-
-replace github.com/rancher/rancher/pkg/plan => /Users/jiaqiluo/rancher-dev-root/rancher/pkg/plan

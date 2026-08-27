@@ -913,7 +913,7 @@ PlanProgressKey = "plan-progress"
 ```go
 case planapi.PlanStatePaused:
     result.InSync = false // suspended by an operator, not converged
-case planapi.PlanStateCanceled:
+case planapi.PlanStateCancelled:
     result.InSync = false
 ```
 
@@ -930,7 +930,7 @@ applied"` — which is indistinguishable from a slow node. Add ahead of the `InS
 ```go
 case entry.Plan.PlanState == planapi.PlanStatePaused:
     return PausedPlanStatusMessage    // "plan execution paused by operator"
-case entry.Plan.PlanState == planapi.PlanStateCanceled:
+case entry.Plan.PlanState == planapi.PlanStateCancelled:
     return CanceledPlanStatusMessage // "plan execution canceled by operator"
 ```
 
@@ -955,7 +955,7 @@ the annotation is what re-arms the node:
 
 ```go
 v, ok := entry.Metadata.Annotations[planapi.PlanCanceledAnnotation]
-if entry.Plan.PlanState == planapi.PlanStateCanceled && (!ok || v == "false") {
+if entry.Plan.PlanState == planapi.PlanStateCancelled && (!ok || v == "false") {
     // operator cleared the cancellation; re-drive the existing plan
 }
 ```
