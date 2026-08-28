@@ -3,7 +3,6 @@ package k8splan
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"maps"
 	"reflect"
@@ -16,12 +15,6 @@ import (
 	"github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
 )
-
-// interruptedEnqueuePeriod controls how often a held or canceled plan is re-enqueued. Annotation
-// removal is delivered through a watch event, so this periodic enqueue is only a safety net for
-// missed events. Using probePeriod (5s by default) would unnecessarily churn the workqueue on
-// every node throughout a pause.
-const interruptedEnqueuePeriod = time.Minute
 
 // reconcileSecret handles Secret change events.
 // It decides whether to apply the plan, runs the apply, and writes outcomes back to the Secret.
@@ -57,9 +50,18 @@ func (w *watcher) reconcileSecret(ctx context.Context, sc corecontrollers.Secret
 		w.hasRunOnce = false
 
 	case rvIsOlder:
-		logrus.Errorf("[k8splan] received secret to process that was older than the last secret operated on (%s vs %s)",
-			secret.ResourceVersion, w.lastAppliedResourceVersion)
-		return secret, errors.New("secret received was too old")
+		// The handler is always invoked with the object held by the informer cache, while
+		// lastAppliedResourceVersion is taken from the response to the agent's own write. The cache
+		// catches up to those writes asynchronously, so a delivery from inside that window is the agent
+		// observing its own feedback, not an out-of-order plan. Interrupt reconciles write the Secret
+		// twice, which widens the window and makes this delivery routine.
+		//
+		// Don't return an error, because it would only add a false alarm and
+		// requeue the plan under the workqueue's exponential rate limiter, stalling the probes with it.
+		logrus.Debugf("[k8splan] skipping secret %s/%s at resource version %s: the cache has not caught up with the last write (%s)",
+			w.connInfo.Namespace, w.connInfo.SecretName, secret.ResourceVersion, w.lastAppliedResourceVersion)
+		sc.EnqueueAfter(w.connInfo.Namespace, w.connInfo.SecretName, w.probePeriod)
+		return secret, nil
 	}
 
 	planData, ok := secret.Data[PlanKey]
@@ -114,11 +116,13 @@ func (w *watcher) reconcileSecret(ctx context.Context, sc corecontrollers.Secret
 			// DeepEqual guard avoids an unnecessary Secret update.
 			mergeProbeStatuses(updates, cp.Plan.Probes, probeStatuses)
 
-			committed, err := w.writeInterruptOutcome(sc, cp.Checksum, updates)
+			committed, err := w.writeInterruptOutcome(sc, cp.Checksum, fmt.Sprintf("recorded the plan as %s", interrupt), updates)
 			if err != nil {
 				return secret, fmt.Errorf("failed to record the %s interrupt: %w", interrupt, err)
 			}
-			sc.EnqueueAfter(w.connInfo.Namespace, w.connInfo.SecretName, interruptedEnqueuePeriod)
+			// Re-enqueue on the probe period, the same cadence as an executing plan.
+			// An interrupt suppresses execution, not observation.
+			sc.EnqueueAfter(w.connInfo.Namespace, w.connInfo.SecretName, w.probePeriod)
 			if committed != nil {
 				return committed, nil
 			}
@@ -182,12 +186,17 @@ func (w *watcher) reconcileSecret(ctx context.Context, sc corecontrollers.Secret
 		}
 	}
 
+	if resumeUpdates != nil {
+		logrus.Infof("[k8splan] the plan with checksum %s is no longer held; resuming into plan-state %q from one-time instruction %d of %d",
+			cp.Checksum, effectiveState, resumeFrom, len(cp.Plan.OneTimeInstructions))
+	}
+
 	// The pending pre-commit already writes plan state, so include the resume update in that write
 	// rather than issuing a separate update.
 	foldResumeIntoPreCommit := resumeUpdates != nil && effectiveState == planapi.PlanStatePending && needsApplied
 	if resumeUpdates != nil && !foldResumeIntoPreCommit {
 		// If this fails the reconcile returns and no apply runs until it lands.
-		committed, resumeErr := w.writeInterruptOutcome(sc, cp.Checksum, resumeUpdates)
+		committed, resumeErr := w.writeInterruptOutcome(sc, cp.Checksum, "cleared the hold on the plan", resumeUpdates)
 		if resumeErr != nil {
 			return secret, fmt.Errorf("failed to commit the resume into plan-state:%s: %w", effectiveState, resumeErr)
 		}
@@ -376,11 +385,11 @@ func (w *watcher) recordInterruptAfterApply(sc corecontrollers.SecretController,
 		logrus.Debugf("[k8splan] plan-state is %q (terminal); not recording the cancellation of the interrupted apply", effectiveState)
 		updates := map[string][]byte{}
 		mergeProbeStatuses(updates, cp.Plan.Probes, probeStatuses)
-		committed, err := w.writeInterruptOutcome(sc, cp.Checksum, updates)
+		committed, err := w.writeInterruptOutcome(sc, cp.Checksum, "recorded the probe statuses of the interrupted apply", updates)
 		if err != nil {
 			return secret, fmt.Errorf("failed to record the probe statuses of the interrupted apply: %w", err)
 		}
-		sc.EnqueueAfter(w.connInfo.Namespace, w.connInfo.SecretName, interruptedEnqueuePeriod)
+		sc.EnqueueAfter(w.connInfo.Namespace, w.connInfo.SecretName, w.probePeriod)
 		if committed != nil {
 			return committed, nil
 		}
@@ -429,11 +438,12 @@ func (w *watcher) recordInterruptAfterApply(sc corecontrollers.SecretController,
 	}
 	mergeProbeStatuses(updates, cp.Plan.Probes, probeStatuses)
 
-	committed, err := w.writeInterruptOutcome(sc, cp.Checksum, updates)
+	committed, err := w.writeInterruptOutcome(sc, cp.Checksum,
+		fmt.Sprintf("recorded the %s outcome of the interrupted apply", applyOutput.Interruption), updates)
 	if err != nil {
 		return secret, fmt.Errorf("failed to record the %s outcome of the interrupted apply: %w", applyOutput.Interruption, err)
 	}
-	sc.EnqueueAfter(w.connInfo.Namespace, w.connInfo.SecretName, interruptedEnqueuePeriod)
+	sc.EnqueueAfter(w.connInfo.Namespace, w.connInfo.SecretName, w.probePeriod)
 	if committed != nil {
 		return committed, nil
 	}

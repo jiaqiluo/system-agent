@@ -297,8 +297,13 @@ func handlePause(currentPlanState planapi.PlanState, data map[string][]byte, che
 			Paused:                true,
 		}),
 	}
+	if resumeState.IsTerminal() {
+		logrus.Infof("[k8splan] %s is set; the plan is not executing one-time instructions, holding it in plan-state %q to resume into %q",
+			planapi.PlanPausedAnnotation, planapi.PlanStatePaused, resumeState)
+		return updates
+	}
 	logrus.Infof("[k8splan] %s is set; holding the plan at %d of %d one-time instructions, to resume into plan-state %q",
-		planapi.PlanPausedAnnotation, existing.Completed, totalOneTimeInstructions, resumeState)
+		planapi.PlanPausedAnnotation, existing.Completed, totalOneTimeInstructions, orDefault(resumeState, planapi.PlanStateInProgress))
 	return updates
 }
 
@@ -321,7 +326,11 @@ func handlePause(currentPlanState planapi.PlanState, data map[string][]byte, che
 //
 // An empty updates map is valid and commonly produced by the write-once guard. In that case the
 // Secret is still read to verify freshness, but no Update is issued.
-func (w *watcher) writeInterruptOutcome(sc corecontrollers.SecretController, checksum string, updates map[string][]byte) (*corev1.Secret, error) {
+//
+// reason names what the write records, in the past tense, and is the subject of the log line emitted
+// on a successful Update. It exists because this function serves both ends of an interrupt: the write
+// that records a hold and the write that clears one.
+func (w *watcher) writeInterruptOutcome(sc corecontrollers.SecretController, checksum, reason string, updates map[string][]byte) (*corev1.Secret, error) {
 	var result *corev1.Secret
 	// The retry wraps the whole read-modify-write, not just the Update: a conflict means the copy
 	// being merged into is stale, so it has to be re-read.
@@ -363,7 +372,7 @@ func (w *watcher) writeInterruptOutcome(sc corecontrollers.SecretController, che
 		}
 		w.lastAppliedResourceVersion = resulting.ResourceVersion
 		result = resulting
-		logrus.Infof("[k8splan] recorded the interrupt outcome on plan secret %s/%s", w.connInfo.Namespace, w.connInfo.SecretName)
+		logrus.Infof("[k8splan] %s on plan secret %s/%s", reason, w.connInfo.Namespace, w.connInfo.SecretName)
 		return nil
 	})
 	return result, err

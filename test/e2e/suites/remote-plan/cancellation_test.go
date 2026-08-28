@@ -119,10 +119,10 @@ var _ = Describe("Remote Plan - Cancellation", Label(framework.ShortTestLabel), 
 			framework.WaitTimeout, 2*time.Second)
 
 		By("Verifying the plan's only instruction never runs, across a full re-enqueue cycle")
-		// Sized to outlast interruptedEnqueuePeriod (60s, reconcile.go:24), so this spans at least one
-		// re-enqueue of the canceled plan. This is the only cancellation coverage for reconciles that
-		// follow the one that recorded the cancellation, which is where a missing terminal-state guard
-		// would surface.
+		// An interrupted plan is re-enqueued on the probe period (5s by default), so this window spans
+		// many re-enqueues of the canceled plan. This is the only cancellation coverage for reconciles
+		// that follow the one that recorded the cancellation, which is where a missing terminal-state
+		// guard would surface.
 		Consistently(func() bool { return nodeFileExists(ctx, podName, cancelPendingRan) },
 			70*time.Second, 5*time.Second).Should(BeFalse(),
 			"a plan canceled before it started must have no side effects on the node whatsoever, "+

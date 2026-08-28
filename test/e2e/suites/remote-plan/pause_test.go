@@ -95,7 +95,8 @@ var _ = Describe("Remote Plan - Pause", Label(framework.ShortTestLabel), func() 
 		// An interrupt suppresses execution, never observation. Freezing probe statuses during a
 		// hold would feed stale health data to Rancher's MachineHealthCheck on exactly the nodes
 		// most likely to be unhealthy — a plan stopped mid-flight leaves the node partly changed.
-		// The agent re-reconciles a held plan once a minute, so allow for more than one cycle.
+		// The agent re-reconciles a held plan on the probe period, the same cadence it uses for an
+		// executing plan, so allow for more than one cycle.
 		//
 		// All three assertions run against one read of the Secret. The non-nil check is what stops
 		// this passing on a probe entry that vanished entirely, and healthy is asserted by its
@@ -112,9 +113,9 @@ var _ = Describe("Remote Plan - Pause", Label(framework.ShortTestLabel), func() 
 
 		By("Verifying the plan is still held and still has not executed anything further")
 		// This is the suite's post-re-enqueue coverage for pause, and it is why the Consistently
-		// windows in the other pause specs do not need to be stretched past
-		// interruptedEnqueuePeriod: reaching this line took at least one full 60s re-enqueue
-		// cycle, because that is the cadence on which the failure above could be recorded at all.
+		// windows in the other pause specs are long enough as they stand: reaching this line took
+		// several re-enqueue cycles, because a re-enqueue is the only thing that can record the
+		// probe failure asserted above.
 		Expect(currentPlanState(ctx)).To(Equal(planapi.PlanStatePaused))
 		Expect(nodeFileExists(ctx, podName, paths.stepTwo)).To(BeFalse())
 	})

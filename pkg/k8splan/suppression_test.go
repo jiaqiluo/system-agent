@@ -309,8 +309,8 @@ func TestPausedPlanNeverExecutes(t *testing.T) {
 				}
 			}
 
-			if periods := rec.enqueuePeriods(); len(periods) != 1 || periods[0] != interruptedEnqueuePeriod {
-				t.Errorf("expected a single re-enqueue after %v, got %v", interruptedEnqueuePeriod, periods)
+			if periods := rec.enqueuePeriods(); len(periods) != 1 || periods[0] != w.probePeriod {
+				t.Errorf("expected a single re-enqueue after %v, got %v", w.probePeriod, periods)
 			}
 		})
 	}
@@ -798,10 +798,10 @@ func TestResumeThenPauseAgainRecordsTheNewerCheckpoint(t *testing.T) {
 // --- Part 6: the interrupt-path re-entry no-op ----------------------------------------------------
 
 // TestInterruptPathReEntryIsANoOp pins the write-once guard against the periodic re-enqueue. While
-// a plan is held the agent re-enters the interrupt path every interruptedEnqueuePeriod for the
-// whole duration of the pause; without the guard that rewrites the Secret every minute and — worse
-// — recomputes the checkpoint from a reconcile where no apply is in flight, which can silently
-// reset a record that had just captured real progress.
+// a plan is held the agent re-enters the interrupt path every probe period for the whole duration
+// of the pause; without the guard that rewrites the Secret on every pass and — worse — recomputes
+// the checkpoint from a reconcile where no apply is in flight, which can silently reset a record
+// that had just captured real progress.
 //
 // The first reconcile arrives on plan-state in-progress so that there IS a suspension to record;
 // the second is the re-entry, by which point plan-state is already paused. Starting both reconciles

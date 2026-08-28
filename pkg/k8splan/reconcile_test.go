@@ -473,22 +473,50 @@ func TestReconcileSecretUIDChangeResetsState(t *testing.T) {
 	}
 }
 
-func TestReconcileSecretStaleResourceVersionRejected(t *testing.T) {
+// TestReconcileSecretStaleResourceVersionSkipped pins that a delivery older than the agent's own
+// last write is a benign skip rather than an error.
+//
+// The handler is always invoked with the object held by the informer cache, and that cache catches
+// up to the agent's own writes asynchronously, so this delivery is routine after any reconcile that
+// writes the Secret — and an interrupt reconcile writes it twice. Skipping is what protects the
+// newer state; returning an error would additionally requeue the plan under the workqueue's
+// exponential rate limiter and stall the probes with it, over a Secret that is not stale in the way
+// the check exists to catch: it carries the same plan.
+func TestReconcileSecretStaleResourceVersionSkipped(t *testing.T) {
 	t.Parallel()
 
-	// No EXPECT() calls are configured: the mock fails the test if reconcileSecret makes any
-	// Kubernetes API call at all, proving the stale-RV path returns before doing any work.
+	planBytes, _ := marshalPlan(t, planapi.Plan{
+		OneTimeInstructions: []planapi.OneTimeInstruction{
+			{CommonInstruction: planapi.CommonInstruction{Name: "must-not-run", Command: "sh", Args: []string{"-c", "true"}}},
+		},
+	})
+
+	// EnqueueAfter is the only permitted call: the mock fails the test if reconcileSecret reads or
+	// writes the Secret, proving the skip returns before doing any work.
 	ctrl := gomock.NewController(t)
 	sc := fake.NewMockControllerInterface[*corev1.Secret, *corev1.SecretList](ctrl)
+	var enqueued []time.Duration
+	sc.EXPECT().EnqueueAfter(testNamespace, testSecret, gomock.Any()).Do(
+		func(_, _ string, d time.Duration) { enqueued = append(enqueued, d) }).AnyTimes()
 
 	w := newTestWatcher(t, true, "100")
 	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Namespace: testNamespace, Name: testSecret, ResourceVersion: "1"},
-		Data:       map[string][]byte{},
+		Data:       map[string][]byte{PlanKey: planBytes},
 	}
 
-	if _, err := w.reconcileSecret(context.Background(), sc, secret, 30*time.Second); err == nil {
-		t.Fatal("expected an error for a stale resource version, got nil")
+	result, err := w.reconcileSecret(context.Background(), sc, secret, 30*time.Second)
+	if err != nil {
+		t.Fatalf("expected a stale delivery to be skipped without an error, got %v", err)
+	}
+	if len(enqueued) != 1 || enqueued[0] != w.probePeriod {
+		t.Errorf("expected a single re-enqueue after %v so the probes keep their cadence, got %v", w.probePeriod, enqueued)
+	}
+	if result.ResourceVersion != "1" {
+		t.Errorf("expected the input secret to be returned untouched at resource version %q, got %q", "1", result.ResourceVersion)
+	}
+	if w.lastAppliedResourceVersion != "100" {
+		t.Errorf("expected the skip to leave lastAppliedResourceVersion at %q, got %q", "100", w.lastAppliedResourceVersion)
 	}
 }
 
@@ -1073,8 +1101,8 @@ func TestReconcileSecretInterruptAtEntrySuppressesTheApply(t *testing.T) {
 			if len(rec.writes()) != 1 {
 				t.Errorf("expected exactly one Update (the interrupt outcome), got %d", len(rec.writes()))
 			}
-			if periods := rec.enqueuePeriods(); len(periods) != 1 || periods[0] != interruptedEnqueuePeriod {
-				t.Errorf("expected a single re-enqueue after %v, got %v", interruptedEnqueuePeriod, periods)
+			if periods := rec.enqueuePeriods(); len(periods) != 1 || periods[0] != w.probePeriod {
+				t.Errorf("expected a single re-enqueue after %v, got %v", w.probePeriod, periods)
 			}
 		})
 	}
@@ -1363,8 +1391,8 @@ func TestReconcileSecretPauseDuringApplyIsNotRecordedAsAFailure(t *testing.T) {
 	if got != want {
 		t.Errorf("expected checkpoint %+v, got %+v", want, got)
 	}
-	if periods := rec.enqueuePeriods(); len(periods) != 1 || periods[0] != interruptedEnqueuePeriod {
-		t.Errorf("expected a single re-enqueue after %v, got %v", interruptedEnqueuePeriod, periods)
+	if periods := rec.enqueuePeriods(); len(periods) != 1 || periods[0] != w.probePeriod {
+		t.Errorf("expected a single re-enqueue after %v, got %v", w.probePeriod, periods)
 	}
 }
 
@@ -1530,8 +1558,8 @@ func TestReconcileSecretCancelDuringApplyIsNotRecordedAsAFailure(t *testing.T) {
 	if got != want {
 		t.Errorf("expected a cancellation report %+v (never a suspension: nothing resumes from it), got %+v", want, got)
 	}
-	if periods := rec.enqueuePeriods(); len(periods) != 1 || periods[0] != interruptedEnqueuePeriod {
-		t.Errorf("expected a single re-enqueue after %v, got %v", interruptedEnqueuePeriod, periods)
+	if periods := rec.enqueuePeriods(); len(periods) != 1 || periods[0] != w.probePeriod {
+		t.Errorf("expected a single re-enqueue after %v, got %v", w.probePeriod, periods)
 	}
 }
 
@@ -1802,8 +1830,8 @@ func TestReconcileSecretInterruptDuringAPeriodicApplyOfATerminalPlan(t *testing.
 			}
 
 			assertPathAbsent(t, mustNotRun, "an interrupt must stop the periodic loop before the next instruction")
-			if periods := rec.enqueuePeriods(); len(periods) != 1 || periods[0] != interruptedEnqueuePeriod {
-				t.Errorf("expected a single re-enqueue after %v, got %v", interruptedEnqueuePeriod, periods)
+			if periods := rec.enqueuePeriods(); len(periods) != 1 || periods[0] != w.probePeriod {
+				t.Errorf("expected a single re-enqueue after %v, got %v", w.probePeriod, periods)
 			}
 
 			writes := rec.writes()
@@ -1850,8 +1878,7 @@ func TestReconcileSecretInterruptDuringAPeriodicApplyOfATerminalPlan(t *testing.
 // delivered. Without the resourceVersion adoption the same race merely 409s.
 //
 // The window is real: "unpause, then push a corrected plan" is an ordinary operator sequence, and
-// the resume reconcile is preceded by a one-minute interruptedEnqueuePeriod gap in which both
-// writes can land.
+// both writes can land in the gap before the resume reconcile runs.
 func TestReconcileSecretResumeAbandonedWhenANewerPlanLanded(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("requires a POSIX shell")

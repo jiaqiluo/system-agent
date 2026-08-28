@@ -718,7 +718,7 @@ func TestWriteInterruptOutcomeRetriesOnConflictAndPreservesTheCheckpoint(t *test
 	}
 
 	w := newTestWatcher(t, true, "")
-	result, err := w.writeInterruptOutcome(sc, checksum, updates)
+	result, err := w.writeInterruptOutcome(sc, checksum, "recorded the test outcome", updates)
 	if err != nil {
 		t.Fatalf("writeInterruptOutcome returned error: %v", err)
 	}
@@ -803,7 +803,7 @@ func TestWriteInterruptOutcomeSkipsTheUpdate(t *testing.T) {
 			sc.EXPECT().Get(testNamespace, testSecret, gomock.Any()).Return(interruptTestSecret(tt.serverPlan, "43", "uid-1", tt.serverData), nil)
 
 			w := newTestWatcher(t, true, "")
-			result, err := w.writeInterruptOutcome(sc, checksum, tt.updates)
+			result, err := w.writeInterruptOutcome(sc, checksum, "recorded the test outcome", tt.updates)
 			if err != nil {
 				t.Fatalf("writeInterruptOutcome returned error: %v", err)
 			}
@@ -847,7 +847,7 @@ func TestWriteInterruptOutcomeReturnsErrorsRatherThanExiting(t *testing.T) {
 			}
 
 			w := newTestWatcher(t, true, "")
-			if _, err := w.writeInterruptOutcome(sc, checksum, map[string][]byte{planapi.PlanStateKey: []byte(planapi.PlanStateCanceled)}); err == nil {
+			if _, err := w.writeInterruptOutcome(sc, checksum, "recorded the test outcome", map[string][]byte{planapi.PlanStateKey: []byte(planapi.PlanStateCanceled)}); err == nil {
 				t.Fatal("expected the error to be returned to the caller, got nil")
 			}
 		})
@@ -871,7 +871,7 @@ func TestWriteInterruptOutcomeRecordsResourceVersionAndUID(t *testing.T) {
 	})
 
 	w := newTestWatcher(t, true, "")
-	if _, err := w.writeInterruptOutcome(sc, checksum, map[string][]byte{planapi.PlanStateKey: []byte(planapi.PlanStateCanceled)}); err != nil {
+	if _, err := w.writeInterruptOutcome(sc, checksum, "recorded the test outcome", map[string][]byte{planapi.PlanStateKey: []byte(planapi.PlanStateCanceled)}); err != nil {
 		t.Fatalf("writeInterruptOutcome returned error: %v", err)
 	}
 	if w.lastAppliedResourceVersion != "44" {
@@ -898,7 +898,7 @@ func TestWriteInterruptOutcomeDoesNotMutateTheFetchedSecret(t *testing.T) {
 	sc.EXPECT().Update(gomock.Any()).DoAndReturn(func(s *corev1.Secret) (*corev1.Secret, error) { return s, nil })
 
 	w := newTestWatcher(t, true, "")
-	if _, err := w.writeInterruptOutcome(sc, checksum, map[string][]byte{planapi.PlanStateKey: []byte(planapi.PlanStateCanceled)}); err != nil {
+	if _, err := w.writeInterruptOutcome(sc, checksum, "recorded the test outcome", map[string][]byte{planapi.PlanStateKey: []byte(planapi.PlanStateCanceled)}); err != nil {
 		t.Fatalf("writeInterruptOutcome returned error: %v", err)
 	}
 	if got := planapi.PlanState(fetched.Data[planapi.PlanStateKey]); got != planapi.PlanStateInProgress {
